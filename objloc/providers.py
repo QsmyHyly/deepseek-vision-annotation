@@ -30,7 +30,13 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator, Protocol
 
-from objloc.config import REASONING_EFFORTS, Settings, get_settings, thinking_payload
+from objloc.config import (
+    IMAGE_DETAILS,
+    REASONING_EFFORTS,
+    Settings,
+    get_settings,
+    thinking_payload,
+)
 from objloc.parsing import decode_json_points
 
 
@@ -48,6 +54,24 @@ class ChatClient(Protocol):
         reasoning_effort: str | None = None,
     ) -> Iterator[dict]:
         ...
+
+
+def image_part(url: str, detail: str | None = None) -> dict:
+    """构造一条 image_url 内容块，可选带上 detail 字段。
+
+    Args:
+        url: http(s) 外链或 data URL。
+        detail: low / high / original / auto（见 config.IMAGE_DETAILS）。
+            空串、None 或不认识的值一律**不带该字段**，交回服务端按 auto 处理。
+
+    为什么非法值不报错：这个函数在"拼一次识别请求"的主路径上，为它抛异常会让整轮识别挂掉，
+    而写错一个 detail 最多只是"没生效"。需要严格校验的是持久化那一步 ——
+    config.local.json 与 PATCH /api/settings 那边会拒绝非法值（objloc/userprefs.py）。
+    """
+    payload: dict[str, Any] = {"url": url}
+    if detail and detail in IMAGE_DETAILS:
+        payload["detail"] = detail
+    return {"type": "image_url", "image_url": payload}
 
 
 def resolve_thinking(

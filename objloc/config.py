@@ -1,7 +1,17 @@
-"""集中式配置。
+"""集中式配置：**部署默认**（环境变量 + 内置常量）。
 
 所有可调参数都从环境变量读取，并提供合理默认值，避免散落在各模块中。
 参考 `.env.example` 了解可配置项。
+
+与 objloc/userprefs.py 的分工（别把两者混起来）：
+
+    config.py      部署配置：环境变量 + 内置默认。进程起来后基本不变，改它要重启。
+    userprefs.py   用户偏好：项目根的 config.local.json。网页上点过的开关落在这里，
+                   要求「立刻生效 + 重启后还在」，同名键**盖过环境变量**。
+                   哪些键能持久化、优先级怎么排，见 AGENTS.md#4.10-持久化用户偏好configlocaljson
+
+Settings 里 thinking / reasoning_effort / use_tools / max_tool_rounds / system_prompt
+这五项走的是 userprefs.resolve()（配置文件 > 环境变量 > 内置默认），其余仍只读环境变量。
 """
 
 from __future__ import annotations
@@ -9,6 +19,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from objloc import userprefs
 
 BASE_DIR = Path(__file__).resolve().parent        # objloc/ 包目录
 PROJECT_ROOT = BASE_DIR.parent                    # 项目根目录
@@ -22,6 +34,9 @@ UPLOAD_DIR = RUNS_DIR / "uploads"
 SCRATCH_DIR = RUNS_DIR / "scratch"
 HISTORY_DIR = RUNS_DIR / "history"
 WEB_STATIC_DIR = BASE_DIR / "web" / "static"      # 静态页随包走
+# 持久化的**用户偏好**（网页上勾过的思考模式 / 工具开关 / 提示词）落在这里，读写见 objloc/userprefs.py。
+# 与 .env 的分工：环境变量是**部署默认**，这个文件是**用户点过的选择**，同名键以后者为准（见 §4.10）。
+PREFS_PATH = PROJECT_ROOT / "config.local.json"
 
 # 默认系统提示词：物体定位 + 工具使用约定
 # ⚠️ 本常量是**全项目唯一**的坐标约定来源（网页 / CLI / 评测 / 内置测试图共用一个 system 消息，
@@ -69,6 +84,21 @@ DEFAULT_SYSTEM_PROMPT = (
 REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
+# image_url 内容块可选的 detail 字段：控制服务端在推理前把图缩到多大。
+#   low      = 缩到 512×512，更快、更省 token（细节够用时优先选它）
+#   high     = 保留原图（与 original 等价，为兼容性保留）
+#   original = 保留原图
+#   auto     = 由服务端自动决定（当前等价 original）
+# 空字符串 = **根本不带这个字段**，也是本项目的默认值：老用法的报文一个字都不变。
+# ⚠️ 别把它当「提高定位精度」的开关。官方说明每张图最多只算 384 token，大图无论如何都会被
+#    服务端缩到约 800×800 —— detail 改的是"缩放发生在哪一层"，不是模型真正看到的像素数。
+#    本项目真正影响定位精度的是坐标口径，见 AGENTS.md#4.3-坐标约定。
+# ⚠️ 这四项抄自官方 image_url 的 detail 说明（本项目 docs/ 的快照是纯文本版，没有多模态那一段，
+#    故此处只记结论、不引锚点），**本机尚未实测**它在 DeepSeek 端的实际效果。默认不发送该字段，
+#    只有用户显式选了才带上去，以免未证实的参数影响既有链路。
+IMAGE_DETAILS = ("low", "high", "original", "auto")
+
+
 def thinking_payload(enabled: bool) -> dict:
     """构造思考模式开关，供 OpenAI SDK 以 extra_body 形式传入。
 
@@ -80,11 +110,8 @@ def thinking_payload(enabled: bool) -> dict:
     return {"thinking": {"type": "enabled" if enabled else "disabled"}}
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+# 注：布尔型环境变量（THINKING / USE_TOOLS）的解析已统一收进 objloc/userprefs.py，
+# 因为那两项还要经过「配置文件 > 环境变量」的选择，解析不能分两处写。
 
 
 def _env_int(name: str, default: int) -> int:
@@ -112,11 +139,25 @@ class Settings:
     # @doc docs/DeepSeek-Models-and-Pricing.md#模型版本对应关系
     # （该文档解决"模型名与版本号怎么对应、为什么只能用 flash"的问题。）
     model: str = field(default_factory=lambda: os.getenv("DEEPSEEK_MODEL", "deepseek-flash"))
-    max_tool_rounds: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 8))
+    # 工具调用最大轮数。取值顺序 配置文件 > MAX_TOOL_ROUNDS > 8，见 objloc/userprefs.py。
+    max_tool_rounds: int = field(default_factory=lambda: userprefs.resolve("max_tool_rounds")[0])
     request_timeout: float = field(default_factory=lambda: float(os.getenv("REQUEST_TIMEOUT", "120")))
 
+    # 是否把已注册的工具交给模型（False = 纯对话，不执行任何工具）。
+    # 网页上的「工具执行框架」勾选框就是它，按次覆盖走 /api/detect 的 use_tools 字段。
+    use_tools: bool = field(default_factory=lambda: userprefs.resolve("use_tools")[0])
+
+    # 图片输入精度：image_url 内容块的 detail 字段，合法值见 IMAGE_DETAILS。
+    # 取值顺序 配置文件 > IMAGE_DETAIL 环境变量 > 空（= 不带该字段，由服务端按 auto 处理）。
+    # 拼报文的那一步在 objloc/providers.py: image_part()。
+    image_detail: str = field(default_factory=lambda: userprefs.resolve("image_detail")[0])
+
     # ---- 提示词 ----
-    system_prompt: str = field(default_factory=lambda: os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT))
+    # 取值顺序 配置文件 > SYSTEM_PROMPT 环境变量 > 内置 DEFAULT_SYSTEM_PROMPT。
+    # ⚠️ 内置那份是**全项目唯一的坐标口径来源**，覆盖它等于改坐标约定，详见 4.3。
+    system_prompt: str = field(
+        default_factory=lambda: userprefs.resolve("system_prompt")[0] or DEFAULT_SYSTEM_PROMPT
+    )
 
     # ---- 思考模式 ----
     # DeepSeek 的思考模式默认开启：模型先流式输出 reasoning_content，再给正文 content。
@@ -124,12 +165,15 @@ class Settings:
     # （实测同一句 1+1 的 completion_tokens 从 35 降到 1，reasoning_tokens 归零），
     # 代价是复杂推理的准确率可能下降，因此做成可切换项而不是写死。
     # 参数形态见 objloc.config.thinking_payload 与 docs/DeepSeek-Thinking-Mode.md。
-    thinking: bool = field(default_factory=lambda: _env_bool("THINKING", True))
+    # ⚠️ 这两项的取值顺序是 配置文件 > 环境变量 > 内置默认（objloc/userprefs.py），
+    # **不是**单纯的环境变量 —— 网页上点过的开关会写进 config.local.json 并盖住环境变量，
+    # 否则「用户改了没反应」；想让环境变量重新生效就删掉文件里的那个键（§4.10）。
+    thinking: bool = field(default_factory=lambda: userprefs.resolve("thinking")[0])
     # 思考强度，仅在思考开启时生效；缺省留空即不传，由服务端按 high 处理。
-    # 合法值见 REASONING_EFFORTS。
+    # 合法值见 REASONING_EFFORTS（userprefs 的规格表直接引用它，不在别处再抄一份）。
     # @doc docs/DeepSeek-Thinking-Mode.md#思考模式开关与思考强度控制
     reasoning_effort: str = field(
-        default_factory=lambda: os.getenv("REASONING_EFFORT", "").strip().lower()
+        default_factory=lambda: userprefs.resolve("reasoning_effort")[0]
     )
 
     # ---- Web 服务 ----
@@ -160,15 +204,25 @@ class Settings:
 
 
 _settings: Settings | None = None
+# 构造 _settings 时 config.local.json 的戳记。用户偏好是**可以随时改**的
+# （网页保存 / 手工编辑），所以单例不能只建一次：戳记一变就重建，
+# 否则「保存了设置却要重启服务才生效」，正是这个功能要消灭的那种挫败。
+_settings_stamp: tuple[int, int] | None = None
 
 
 def get_settings(refresh: bool = False) -> Settings:
-    """获取全局配置单例。"""
-    global _settings
-    if _settings is None or refresh:
+    """获取全局配置单例。
+
+    当 config.local.json 被改动过（戳记变化）时会自动重建，手改文件不必重启服务；
+    显式传 refresh=True 则强制重建（测试改完 config.* 目录常量后用它）。
+    """
+    global _settings, _settings_stamp
+    stamp = userprefs.stamp()
+    if _settings is None or refresh or stamp != _settings_stamp:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         _settings = Settings()
+        _settings_stamp = stamp
     return _settings

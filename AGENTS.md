@@ -38,6 +38,11 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 - ✅ **思考模式可开关**（见 4.6）：网页勾选框 / `main.py detect --no-thinking` / `THINKING=0`。
   实测同批基准图：思考开 4.9s / 思考关 2.2s，检出率与标签准确率都是 100%，
   平均 IoU 0.842 → 0.873（`scripts/compare_thinking.py`，报告在 `runs/thinking_ab/`）。
+- ✅ **识别参数可长期保存**（2026-09，见 §4.10）：网页左栏「识别参数」的每一项（思考模式 /
+  思考强度 / 工具开关 / 工具轮数 / 图片精度 / 提示词）都落进项目根的 `config.local.json`，
+  重启服务、换浏览器都还在；也能直接手改文件。优先级
+  **内置默认 < 环境变量 < 配置文件 < 单次请求**，接口 `GET/PATCH/DELETE /api/settings`，
+  保存后**不用重启**（服务端按文件 mtime 重建配置）。
 - ✅ **上传/结果存储/历史记录**：每次打标落 `runs/history/<run_id>/`（meta.json + annotated.png），
   服务重启后仍可查；见 §4.9。网页左栏第 4 个 Tab「历史记录」可列表 / 回看 / 删除这些记录
   （**回看 ≠ 重新识别**，语义与断言见 §4.7）。
@@ -45,7 +50,7 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 - ✅ 网页截图组实测（第 ⑤ 组，4 图 28 目标）：**检出率 100%、平均 IoU 0.856、标签准确率 97%**，
   关掉思考同样 100% 检出、耗时减半（详见第 7 节）。
 - ✅ 自测全绿：`tests/test_parser.py`、`tests/test_e2e.py`、`tests/test_benchmark.py`、`tests/test_docrefs.py`、
-  `tests/test_web_samples.py`（均离线，不花 API）；
+  `tests/test_web_samples.py`、`tests/test_storage.py`、`tests/test_userprefs.py`（均离线，不花 API）；
   另有前端回归自检 `tests/ui/`（id 双向校验 + 真实浏览器驱动页面），见 4.7。
 
 ---
@@ -66,10 +71,17 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
   | `DEEPSEEK_MODEL` | `deepseek-flash` | **就是 DeepSeek-V4.1-Flash**；官方另一档 `deepseek-v4-pro` **不支持图像理解**，本项目不能换（见 6.11） |
   | `LLM_PROVIDER` | `auto` | `auto`/`deepseek`/`mock` |
   | `MAX_TOOL_ROUNDS` | `8` | 工具调用最大轮数 |
+  | `USE_TOOLS` | `1` | 是否把工具交给模型（`0` 关闭工具执行框架） |
+  | `IMAGE_DETAIL` | 空 | 图片输入精度 `low/high/original/auto`（image_url 的 `detail`）；空 = 不带该字段 |
   | `SYSTEM_PROMPT` | 内置 | 覆盖系统提示词 |
   | `THINKING` | `1` | 思考模式默认开关（`0` 关闭） |
   | `REASONING_EFFORT` | 空 | 思考强度 `low/medium/high/xhigh/max`，空 = 服务端默认 high |
   | `WEB_HOST`/`WEB_PORT` | `127.0.0.1`/`8765` | 网页服务 |
+
+- ⚠️ **其中六项还可以被 `config.local.json` 覆盖**（`THINKING` / `REASONING_EFFORT` /
+  `USE_TOOLS` / `MAX_TOOL_ROUNDS` / `IMAGE_DETAIL` / `SYSTEM_PROMPT`）。取值顺序是
+  **内置默认 < 环境变量 < 配置文件 < 单次请求字段** —— 即网页上点过的开关**盖过**环境变量。
+  完整清单、接口与代价见 §4.10；用一个坏掉的偏好文件不会让服务起不来（回落 + 警告）。
 
 - **模型事实（实测）**：`deepseek-flash` 是**思考模型**（默认开启），`reasoning_content` 有内容、
   `content` 才是正文；流式实现已同时处理两者。多模态图片用 `image_url`（http / data URL）。
@@ -82,12 +94,14 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 ```
 main.py                      CLI 入口（web / detect / tools / demo）
 requirements.txt  .env.example  README.md  AGENTS.md
+config.local.json            用户偏好（网页「识别参数」保存的值；运行时生成，已 gitignore）
 docs/                        DeepSeek 官方 API 文档快照
   DeepSeek-Chat-Completions-API.md / DeepSeek-Tool-Calls.md
   DeepSeek-Thinking-Mode.md  思考模式开关 / 强度 / reasoning_content 回传规则 + 本项目实测
   DeepSeek-Models-and-Pricing.md  模型名 ↔ 版本号对应、价格与限速、为什么只能用 deepseek-flash
 objloc/                      ★核心包
   config.py                  集中配置（Settings 单例）；RUNS_DIR 指项目根
+  userprefs.py               ★持久化用户偏好：项目根 config.local.json 的读写 / 校验 / 优先级（见 4.10）
   providers.py               ★模型客户端：统一流式事件协议 + OpenAI 兼容 + 离线 Mock
   client.py                  客户端门面：stream_chat / stream_text / infer / 旧签名兼容
   parsing.py                 坐标 JSON 解析（容忍说明文字、代码块、单引号）
@@ -110,6 +124,8 @@ scripts/
   compare_thinking.py        ★思考模式 A/B 对照（同一批内置测试图，开/关各跑一遍比准确率与耗时）
 tests/                       自测
   test_parser.py / test_e2e.py / test_benchmark.py / test_docrefs.py
+  test_storage.py            历史记录 / 上传落盘的离线自测（见 4.9）
+  test_userprefs.py          用户偏好：优先级 / 校验 / 原子写 / 容错 的离线自测（见 4.10）
   test_web_samples.py        网页截图组：真值与 PNG 是否同源、能否被自动打分（见 §7）
                              纯离线，不花 API、也不需要服务在跑
   ui/                        前端回归自检（见 4.7）
@@ -234,7 +250,8 @@ DeepSeek 默认先输出思维链（`reasoning_content`）再给正文。本项�
 - **三层开关**（按优先级）：
   1. 按次覆盖 —— 网页「思考模式」勾选框（`POST /api/detect` 的 `thinking` 字段）、
      `run_agent(thinking=...)`、`main.py detect --no-thinking`、`scripts/benchmark.py --no-thinking`；
-  2. 服务端默认 —— 环境变量 `THINKING=0/1`（`Settings.thinking`）；
+  2. 服务端默认 —— `Settings.thinking`，它自己又是一条 配置文件 > 环境变量 `THINKING=0/1` >
+     缺省开启 的小链（见 4.10）。网页上勾的那个框会写进 `config.local.json` 并**盖住环境变量**；
   3. 缺省开启。
 - **一处实现**：`objloc/providers.py: resolve_thinking()` 是唯一解析处，真实客户端与 Mock 共用，
   别再各写一份（曾经 Mock 漏了 effort 合法性校验，被自测抓出来）。
@@ -405,6 +422,15 @@ GET    /api/history/{run_id}/source              源图
   验收必须包含**重启服务再查**这一步，只在进程内跑通不算数。
 - **保留策略**：`HISTORY_MAX`（默认 200，`0` = 不限），每次新增记录后按 `run_id` 删最老的。
   这是防「只增不减」的闸门 —— 原来根目录 162 张散图就是这么攒出来的。
+- ⚠️ **删除必须"删不掉就如实说"**（`storage.py: _rmtree_retry()`，2026-09）。Windows 上一次性删二十来条
+  记录时，偶发有几条 `shutil.rmtree` 抛 WinError 32（文件正被杀软扫描 / 被索引器或读句柄占着）。
+  原先是 `except OSError: pass`，于是**接口回 200、界面写"已清空 22 条"，盘上却剩 5 条**；
+  `tests/ui/ui_check.mjs` 的历史组连着两次挂在这上面（77/80），第三次又自己好了 —— 典型的偶发。
+  现在改成短重试 + 仍失败就打印到 stderr，并且 `clear_runs()` 返回的是**真正删掉的条数**
+  （前端那句「已清空 N 条」因此不再是空话）。负向对照见 `tests/test_storage.py` 第 11 组：
+  把老写法装回去，同一个"瞬时占用"必须真的少删一条 —— 证明这次改动测的不是空气。
+  ⚠️ 说实话：**这个偶发在改动后没有再现过**（复现那两次都是改动前），所以只能说
+  "机制上成立 + 单测覆盖到位"，不能说"亲眼见它修好了"。
 
 **上传侧的三条硬约束**（`POST /api/upload` / `_register_image`）：
 1. **大小上限**：`MAX_UPLOAD_MB`（默认 20，`0` = 不限）。边写边累计字节，超限立刻中断、**删掉已写的临时文件**、回 413。
@@ -425,6 +451,102 @@ GET    /api/history/{run_id}/source              源图
 
 **改完必须跑**：`python tests/test_storage.py`（新增，离线）+ 现存 5 个离线测试 + `python tests/ui/check_frontend_contract.py`。
 历史面板的浏览器断言在 `tests/ui/ui_check.mjs` 里，见 4.7。
+
+---
+
+### 4.10 持久化用户偏好（config.local.json）
+
+**它解决什么问题**：网页「识别参数」里的开关（思考模式 / 思考强度 / 工具开关 / 工具轮数 /
+图片精度 / 提示词）原本只活在浏览器的 localStorage 里 —— 换个浏览器、清一次缓存就没了，而且**服务端看不到**：
+CLI、评测脚本、以及 `/api/detect` 省略字段时的兜底值，用的仍是环境变量那一套。
+现在这份「用户点过的选择」落在**项目根目录的 `config.local.json`**：重启服务还在、
+换浏览器还在、能手改、CLI 也能读到。
+
+**优先级（低 → 高）**：
+
+```
+内置默认  <  环境变量  <  config.local.json  <  单次请求里的字段
+```
+
+⚠️ 配置文件排在环境变量**之上**是刻意的：这一层的语义是「用户明确点过的开关」，环境变量是
+「部署方的默认值」，用户点过就该算数，否则网页上改了没反应。**代价要说清**：`THINKING=0`
+这类环境变量会被文件里的同名键盖住。想让环境变量重新生效，走 `DELETE /api/settings`
+（或手删文件里那一行）—— 这是唯一的出口。
+
+**只认文件里「显式出现过」的键**：没写的键一律回落到环境变量 / 内置默认。所以
+「从来没碰过设置」与「把设置改回默认值」是两件事，前者完全不受本文件影响 —— 这也是
+新增这项功能对老用法 100% 向后兼容的原因（不生成文件时行为与改动前完全一致）。
+
+**可持久化的键**（唯一真相是 `objloc/userprefs.py: _specs()` 的规格表，别在别处再抄一份）：
+
+| 键 | 类型 / 范围 | 对应环境变量 | 默认 | 网页上可改 |
+|---|---|---|---|---|
+| `thinking` | bool | `THINKING` | true | ✅ 思考模式勾选框 |
+| `reasoning_effort` | 枚举 `""/low/medium/high/xhigh/max` | `REASONING_EFFORT` | `""`（服务端按 high） | ✅ 下拉框 |
+| `use_tools` | bool | `USE_TOOLS` | true | ✅ 工具执行框架勾选框 |
+| `max_tool_rounds` | int 1~64 | `MAX_TOOL_ROUNDS` | 8 | ✅ 数字输入框 |
+| `image_detail` | 枚举 `""/low/high/original/auto` | `IMAGE_DETAIL` | `""`（= 不带该字段） | ✅ 图片精度下拉框 |
+| `prompt` | str ≤ 4000 字 | — | `""`（前端用占位符里的默认话术） | ✅ 提示词输入框 |
+| `system_prompt` | str ≤ 8000 字 | `SYSTEM_PROMPT` | `DEFAULT_SYSTEM_PROMPT` | ❌ `ui: false`，只能改文件 |
+
+最后一项刻意不暴露在界面上：它承载**全项目的坐标口径**（见 4.3），让网页随手改会把约定改坏。
+它进这张表是为了让「不想设环境变量的场合」也能覆盖系统提示词，而不是鼓励去改。
+
+**`image_detail` 是干什么的**：它是 `image_url` 内容块上的 `detail` 字段，控制服务端在推理前把图缩到多大
+（`low` = 512×512；`high`/`original` = 保留原图；`auto` ≈ original）。拼报文只有一处实现 ——
+`objloc/providers.py: image_part()`，`objloc/agent.py: build_messages` 与 `objloc/client.py` 共用它。
+⚠️ **别把它当"提高定位精度"的开关**：官方说明每张图最多只算 384 token，大图无论如何都会被缩到约 800×800，
+所以它改的是"缩放发生在哪一层"，不是模型真正看到的像素数。本项目的定位精度取决于坐标口径（§4.3）。
+⚠️ 这四个取值抄自官方 image_url 的 `detail` 说明（本项目 `docs/` 的快照是纯文本版，没有多模态那一段），
+**本机尚未实测**它在 DeepSeek 端的效果；因此默认留空 = 不发送该字段，老用法的报文逐字节不变。
+
+**文件长这样**（能手改，键的顺序与缩进由 json.dumps 决定，不必对齐）：
+
+```jsonc
+{
+  "max_tool_rounds": 6,
+  "prompt": "识别图中的主要物体，输出中文名称",
+  "thinking": false
+}
+```
+
+**HTTP 接口**（`objloc/web/app.py`）：
+
+```
+GET    /api/settings            当前生效值 / 来源(file|env|default) / 可选范围 / 警告
+PATCH  /api/settings            按 key 部分更新；非法值 400 且**一项都不写**
+DELETE /api/settings[?keys=a,b] 删掉键 -> 回落到 环境变量 > 内置默认；省略 keys = 全部重置
+```
+
+- `GET` 的 `sources` 是给界面看的：环境变量与文件会打架，界面必须能说清「这个值是谁定的」，
+  否则用户只会得出「保存没生效」这个结论。前端在 `#prefsStatus` 里逐项点名**不是来自文件**的那些值。
+- `PATCH` **先整体校验再落盘**：一半合法一半非法的请求必须一项都不写 ——
+  返回 400 却已经改掉一半，比直接失败更难排查（自测第 5 组锁的就是这条）。
+
+**三项实现要点**（改这个模块前先读 `objloc/userprefs.py` 的模块头注释）：
+
+1. **原子写**：先写同目录的 `.tmp` 再 `os.replace()`（同盘 rename 是原子操作）。中途崩溃最多
+   丢掉这一次修改，不会留下半截 JSON 让下次启动解析失败。
+2. **读侧容错**：文件损坏 / 顶层不是对象 → 空配置 + 一条警告，**绝不抛异常**；
+   单项非法 → 只丢那一项；未知键 → 忽略但**原样保留**（手写的注释性键不该被本模块抹掉）。
+   一个坏掉的偏好文件不该让整个服务起不来。
+3. **热生效**：`config.get_settings()` 每次比对 `userprefs.stamp()`（mtime_ns + size），
+   戳记变了就重建 Settings 单例。所以「保存 → 下次识别立刻生效」不需要重启服务，
+   手改文件同理。⚠️ 这也意味着**不能把配置值缓存进模块级常量**，否则热生效会静默失效。
+
+**前端约定**：`config.local.json` 是识别参数的**唯一真相**，localStorage 里只留
+对比模式这类纯显示偏好（`state.view`）。两边各存一份迟早漂移 ——
+用户以为自己改的是长期默认值，其实只改了这台浏览器。首屏 `GET /api/settings` 回来时
+若用户已经动过控件则不覆盖（`state.prefs.touched`），否则两者会赛跑。
+
+**改完必须跑**：`python tests\test_userprefs.py`（离线，含 `--control` 负向对照）
++ 现存 6 个离线测试 + `python tests/ui/check_frontend_contract.py`。
+界面这一侧另有 `node runs/verify_prefs_ui.mjs`（28 条断言，不花 API）：改控件 → 落盘 → **刷新页面**
+→ 控件按盘上的值恢复；外带"直接改服务端后刷新界面要跟着变""非法值不许写坏盘""localStorage 里
+不该有这些键"三条反证。加 `--control` 拦掉 PATCH/DELETE 后必须**故意失败**（负向对照）。
+⚠️ 写这类浏览器断言时注意两个竞态：保存是异步的，文件刚出现时状态行可能还是「保存中…」；
+「恢复默认」后文件消失也不代表浏览器收到了响应 —— 要等一个**因果上的完成信号**
+（状态行落定 / 提示条出现），而不是反复轮询到断言自己成立，那等于没测（这两个坑都踩过）。
 
 ---
 
@@ -462,6 +584,9 @@ python tests\test_parser.py
 python tests\test_e2e.py
 python tests\test_benchmark.py
 python tests\test_docrefs.py     # @doc 交叉引用：目标文件存在 / docs 无孤儿 / 锚点对得上（见 4.8）
+python tests\test_storage.py     # 历史记录 / 上传落盘（见 4.9）
+python tests\test_userprefs.py   # 用户偏好 config.local.json（见 4.10）
+python tests\test_userprefs.py --control   # 负向对照：打桩掉"配置文件"这一层，必须**故意失败**
 python tests\test_web_samples.py # 网页截图组：真值/PNG/尺寸同源 + 完美预测应满分（见 7）
                                  # 缺 node/Playwright 时打印 SKIP 并以 0 退出，不假装通过
 
@@ -621,9 +746,11 @@ python scripts\verify_gt.py runs\benchmark_v2_hard\images # 10 图 × 4 图形
 
 - [ ] 评测：加入更多干扰（重叠图形、背景纹理、旋转文字、密集小目标），以及"点定位"精度评测。
 - [ ] 评测：支持 A/B 多提示词自动对比（已有 `--system-prompt`，可再写批量脚本）。
-- [ ] 前端：对比模式增加"差异高亮"、标注列表点选定位（缩放 / 平移 / 全屏已完成，见 4.7）。
+- [x] 前端：对比模式增加"差异高亮"、标注列表点选定位（缩放 / 平移 / 全屏已完成，见 4.7）。
+- [x] 配置：**识别参数可长期保存**（完成于 §4.10）：`config.local.json` + `/api/settings` 三个接口，
+  保存后按文件 mtime 热生效，不必重启。
+- [ ] 工具：增加 `crop_image`、`zoom_region` 等二次观察工具，让 agent "放大再看"。
 - [x] 后端：**打标记录的持久化**（完成于 §4.9）：每次打标落 `runs/history/<run_id>/`，
   服务重启后仍可查、可看原图。⚠️ 范围要说清：`IMAGES`（当前选中的图片这一会话态）**仍然是
   进程内内存字典**，重启后要重新上传/重新载入图片；持久化的只是打标记录本身，不是整个会话。
-- [ ] 工具：增加 `crop_image`、`zoom_region` 等二次观察工具，让 agent "放大再看"。
 - [ ] 支持多图 / 批量打标对比。

@@ -4,6 +4,9 @@
     GET  /                     对比页面（web/static/index.html）
     GET  /api/health           运行状态（provider / 是否有 Key / 工具列表）
     GET  /api/tools            已注册工具清单
+    GET  /api/settings         当前生效的用户偏好（值 / 来源 / 可选范围），持久化在 config.local.json
+    PATCH  /api/settings       按 key 保存若干项偏好（部分更新），保存后立即生效，无需重启
+    DELETE /api/settings       删掉偏好键 -> 回落到 环境变量 > 内置默认
     POST /api/upload           上传图片或提交图片 URL -> 返回 image_id
     POST /api/detect           SSE 流式识别（流式输出 + 工具执行），结束前给出标注图
                                请求体可带 thinking: true/false 按次开关思考模式
@@ -47,8 +50,9 @@ from fastapi.staticfiles import StaticFiles
 from objloc import config
 from objloc import samples as samples_mod
 from objloc import storage
+from objloc import userprefs
 from objloc.agent import build_messages, collect_items, run_agent
-from objloc.config import WEB_STATIC_DIR, get_settings
+from objloc.config import IMAGE_DETAILS, WEB_STATIC_DIR, get_settings
 from objloc.parsing import (
     LEGACY_SCALE_NOTICE,
     check_coordinate_range,
@@ -105,16 +109,63 @@ def health() -> dict:
         "model": settings.model,
         "base_url": settings.base_url,
         "tools": REGISTRY.names(),
+        # 下面五项是「识别参数」的当前生效默认值（来自 config.local.json / 环境变量 / 内置默认，
+        # 谁定的见 GET /api/settings 的 sources）。按次覆盖走 /api/detect 的同名字段。
         "max_tool_rounds": settings.max_tool_rounds,
-        # 思考模式的默认值（网页开关的初始状态）；按次覆盖走 /api/detect 的 thinking 字段
+        "use_tools": settings.use_tools,
         "thinking": settings.thinking,
         "reasoning_effort": settings.reasoning_effort or "server-default",
+        "image_detail": settings.image_detail or "server-default",
     }
 
 
 @app.get("/api/tools")
 def tools() -> dict:
     return {"tools": REGISTRY.describe()}
+
+
+# --------------------------------------------------------------------------- #
+# 用户偏好：持久化在项目根的 config.local.json
+# 规格、优先级与容错口径全在 objloc/userprefs.py，本层只做 HTTP 包装 + 错误码翻译。
+# @doc AGENTS.md#4.10-持久化用户偏好configlocaljson
+# （该文档解决「哪些设置能长期保存、存在哪、优先级怎么排」的问题。）
+# --------------------------------------------------------------------------- #
+@app.get("/api/settings")
+def read_settings() -> dict:
+    """当前生效的全部偏好：值 / 来源 / 内置默认 / 可选范围。
+
+    「来源」（file / env / default）是给界面看的：环境变量 THINKING=0 与配置文件里的
+    thinking 会打架，界面必须能说清这个值到底是谁定的，否则用户会以为「保存没生效」。
+    """
+    return userprefs.effective()
+
+
+@app.patch("/api/settings")
+def update_settings(payload: dict) -> dict:
+    """按 key 合并保存若干项偏好（部分更新），返回保存后的完整快照。
+
+    保存后 config.get_settings() 会因为文件 mtime 变化自动重建单例（见 objloc/config.py），
+    所以**下一次识别立刻用新设置，不必重启服务** —— 这正是这个接口存在的意义。
+    """
+    try:
+        return userprefs.save(payload or {})
+    except userprefs.PrefsError as exc:
+        # 值非法 = 用户输入问题，400 而不是 500；detail 里带上「哪一项、哪里不对」
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/settings")
+def reset_settings(keys: str | None = None) -> dict:
+    """删掉偏好键，让它们回落到「环境变量 > 内置默认」。
+
+    keys 用逗号分隔（?keys=thinking,prompt），省略 = 全部重置。
+    这是「配置文件盖住了环境变量」的唯一出口：删掉键，环境变量就重新生效。
+    """
+    parsed = [k.strip() for k in keys.split(",") if k.strip()] if keys else None
+    try:
+        return userprefs.reset(parsed)
+    except userprefs.PrefsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -510,12 +561,41 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+def _pick_int(raw: Any, fallback: int, low: int, high: int) -> int:
+    """取一个可选的整数按次覆盖值；缺省 / 解析不了 / 越界一律回落到 fallback。
+
+    这里刻意不抛 400：轮数是个"调优旋钮"而不是关键输入，为它打断整轮识别不划算 ——
+    真正需要严格校验的是持久化那一步（objloc/userprefs.py 会拒绝非法值）。
+    """
+    if raw is None or isinstance(raw, bool):
+        return fallback
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return value if low <= value <= high else fallback
+
+
+def _pick_detail(raw: Any, fallback: str) -> str:
+    """取一个可选的图片精度覆盖值；缺省 / 不认识的值一律回落到 fallback。
+
+    与 _pick_int 同样的取舍：这是"调优旋钮"，写错一个值不该让整轮识别挂掉，
+    真正需要严格校验的是持久化那一步（PATCH /api/settings 会拒绝非法值）。
+    """
+    value = str(raw or "").strip().lower()
+    return value if value in IMAGE_DETAILS else fallback
+
+
 @app.post("/api/detect")
 async def detect(payload: dict):
     """SSE 流式识别：边流式输出边执行工具，结束时回传标注图。
 
-    请求体字段：image_id / prompt / use_tools / model / thinking / reasoning_effort。
-    thinking 省略时沿用服务端默认（THINKING 环境变量），显式传 false 即关闭思考模式。
+    请求体字段：image_id / prompt / use_tools / max_tool_rounds / model /
+    thinking / reasoning_effort / image_detail。
+    thinking 与 use_tools 省略时沿用**当前生效**的默认值（config.local.json > 环境变量 > 内置，
+    见 objloc/userprefs.py §4.10），显式传 true/false 才按次覆盖；
+    max_tool_rounds 越界或缺省时同样回落到 Settings.max_tool_rounds；
+    不认识的 image_detail 同样回落（见 _pick_detail）。
 
     @doc docs/DeepSeek-Thinking-Mode.md#本项目中的落地位置
     """
@@ -524,8 +604,17 @@ async def detect(payload: dict):
     if not record:
         raise HTTPException(status_code=404, detail="图片不存在，请先上传")
 
+    # 本轮的配置快照：整个请求只取一次，中途用户改配置也不会让同一轮识别前后用两套设置。
+    # get_settings() 会在 config.local.json 变动时自动重建单例，所以这里拿到的一定是最新值。
+    settings = get_settings()
+
     prompt = (payload.get("prompt") or "").strip() or "请识别图中的主要目标，并按约定输出坐标。"
-    use_tools = bool(payload.get("use_tools", True))
+    # 工具开关：缺省（None）时沿用 Settings.use_tools（config.local.json / 环境变量），
+    # 显式传 true/false 才按次覆盖 —— 与 thinking 同一套三态语义，
+    # 别写成 `bool(payload.get("use_tools", True))`，那会把「没传」变成「强制开启」。
+    use_tools_raw = payload.get("use_tools", None)
+    use_tools = settings.use_tools if use_tools_raw is None else bool(use_tools_raw)
+    max_rounds = _pick_int(payload.get("max_tool_rounds"), settings.max_tool_rounds, 1, 64)
     # 按次覆盖模型的逃生口，正常流程用不到：网页从不发送这个字段。
     # ⚠️ 本项目是视觉定位，只有 deepseek-flash（= DeepSeek-V4.1-Flash）支持图像理解，
     # 覆盖成 deepseek-v4-pro 会让请求直接失败。
@@ -537,6 +626,9 @@ async def detect(payload: dict):
     thinking_raw = payload.get("thinking", None)
     thinking = None if thinking_raw is None else bool(thinking_raw)
     effort = (payload.get("reasoning_effort") or "").strip() or None
+    # 图片输入精度（image_url 的 detail）：只认 config.IMAGE_DETAILS 里的四项，
+    # 缺省/空串/写错都回落到 Settings.image_detail，理由同 _pick_int。
+    detail = _pick_detail(payload.get("image_detail"), settings.image_detail)
 
     # 传给多模态模型的图片使用 data URL，避免外链不可达
     image_data_url = image_to_data_url_from_source(record["path"])
@@ -547,13 +639,12 @@ async def detect(payload: dict):
 
     def event_stream() -> Iterator[str]:
         events: list[dict] = []
-        messages = build_messages(prompt, image=image_data_url)
+        messages = build_messages(prompt, image=image_data_url, image_detail=detail)
         try:
             client = None
             if model_id:
                 from objloc.providers import OpenAICompatClient
-                from objloc.config import get_settings as _gs
-                settings = _gs()
+
                 client = OpenAICompatClient(
                     type(settings)(**{**settings.__dict__, "model": model_id})
                 )
@@ -561,6 +652,7 @@ async def detect(payload: dict):
                 messages,
                 client=client,
                 registry=REGISTRY,
+                max_rounds=max_rounds,
                 use_tools=use_tools,
                 tool_context={"source": record["path"]},
                 thinking=thinking,
@@ -622,7 +714,6 @@ async def detect(payload: dict):
                 # 只在真的画出了标注图时才记 —— 一条没有 annotated.png 的记录在历史面板里
                 # 只会是张裂图，而「没解析到坐标」这件事前端已经用 warning 说清了。
                 try:
-                    settings = get_settings()
                     storage.record_run(
                         run_id=run_id,
                         kind="detect",

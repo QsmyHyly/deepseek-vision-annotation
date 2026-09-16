@@ -344,6 +344,124 @@ cleared = client.delete("/api/history").json()["removed"]
 check("9.20 DELETE /api/history 清空",
       cleared >= 1 and client.get("/api/history").json()["total"] == 0, str(cleared))
 
+# ---------------------------------------------------------------- 11. 删除被占用：不许静默地"部分成功"
+# 来历（本机实测踩过）：一次性删二十来条记录时，偶发有几条 shutil.rmtree 抛 WinError 32
+# （文件正被杀软扫描 / 被索引器或读句柄占着），而 clear_runs 原先是 `except OSError: pass` ——
+# 接口照样 200、界面照样写"已清空 22 条"，盘上却剩 5 条。删不掉的必须**如实反映在计数里**。
+import contextlib as _ctx   # noqa: E402
+import io as _io            # noqa: E402
+import shutil as _shutil    # noqa: E402
+
+
+def _seed(n):
+    """写 n 条记录，返回 run_id 列表（走 storage.record_run，与真实落盘路径完全一致）。"""
+    ids = []
+    for i in range(n):
+        meta = storage.record_run(
+            kind="annotate", source=new_source(image_id="imgdel%06d" % i)[1],
+            prompt="删除自检 %d" % i, items=ITEMS, thinking=False,
+            reasoning_effort=None, model="mock", duration_ms=None,
+        )
+        ids.append(meta["run_id"])
+    return ids
+
+
+_real_rmtree = _shutil.rmtree
+storage.clear_runs()
+seeded = _seed(4)
+check("11.0 造出 4 条记录备用", storage.list_runs(limit=0)[1] == 4, str(seeded))
+
+# (a) 瞬时占用：第一次 rmtree 抛 OSError，重试应当把它删掉 —— 不许因此少删一条
+_calls = {"n": 0}
+
+
+def _flaky_rmtree(path, *a, **kw):
+    if _calls["n"] == 0:
+        _calls["n"] += 1
+        raise PermissionError(32, "The process cannot access the file（模拟瞬时占用）")
+    return _real_rmtree(path, *a, **kw)
+
+
+_err = _io.StringIO()
+with _ctx.redirect_stderr(_err):
+    _shutil.rmtree = _flaky_rmtree
+    try:
+        removed_a = storage.clear_runs()
+    finally:
+        _shutil.rmtree = _real_rmtree
+left_a = storage.list_runs(limit=0)[1]
+check("11.1 瞬时被占用会重试，4 条最终全删掉（不因此少删）",
+      removed_a == 4 and left_a == 0, "removed=%s 重试触发=%s 剩=%s" % (removed_a, _calls["n"], left_a))
+check("11.2 重试成功时不该往 stderr 喷警告", _err.getvalue() == "", _err.getvalue()[:120])
+
+# (b) 一直删不掉：必须**少报**并在 stderr 留证据，绝不谎报"全删了"
+_seeded2 = _seed(3)
+_err2 = _io.StringIO()
+
+
+def _always_fail(path, *a, **kw):
+    raise PermissionError(32, "一直被占用")
+
+
+with _ctx.redirect_stderr(_err2):
+    _shutil.rmtree = _always_fail
+    try:
+        removed_b = storage.clear_runs()
+        single_ok = storage.delete_run(_seeded2[0])
+    finally:
+        _shutil.rmtree = _real_rmtree
+left_b = storage.list_runs(limit=0)[1]
+check("11.3 一直删不掉时返回 0 而不是谎报 3",
+      removed_b == 0 and left_b == 3, "removed=%s 剩=%s" % (removed_b, left_b))
+check("11.4 删不掉时 stderr 有可查的证据（不是静默跳过）",
+      "删除失败" in _err2.getvalue(), _err2.getvalue()[:160])
+check("11.5 逐条删除同一口径：删不掉返回 False（HTTP 层据此回 404 而不是 200）",
+      single_ok is False, str(single_ok))
+# 负向对照：撤掉"占用"桩，同样这三条必须立刻删得掉 —— 证明上面失败的是占用，不是 clear_runs 本身。
+check("11.6 撤掉占用桩后同样的三条立刻删得掉，计数回到 3",
+      storage.clear_runs() == 3 and storage.list_runs(limit=0)[1] == 0)
+
+# (c) 负向对照：把改动前的写法（不重试、静默 except OSError: pass）装回来，
+# 同一个"瞬时占用"必须让它**真的少删一条** —— 否则说明 11.1 / 11.4 测的不是这回事。
+def _legacy_clear():
+    """复刻改动前的 clear_runs：不重试、不记证据、静默跳过删不掉的。"""
+    removed = 0
+    for entry in list(storage.history_dir().iterdir()):
+        if not entry.is_dir() or not storage.is_valid_run_id(entry.name):
+            continue
+        try:
+            _shutil.rmtree(entry)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+_seed(3)
+_calls2 = {"n": 0}
+
+
+def _fail_once_again(path, *a, **kw):
+    if _calls2["n"] == 0:
+        _calls2["n"] += 1
+        raise PermissionError(32, "瞬时占用")
+    return _real_rmtree(path, *a, **kw)
+
+
+_err3 = _io.StringIO()
+with _ctx.redirect_stderr(_err3):
+    _shutil.rmtree = _fail_once_again
+    try:
+        legacy_removed = _legacy_clear()
+    finally:
+        _shutil.rmtree = _real_rmtree
+legacy_left = storage.list_runs(limit=0)[1]
+check("11.7 负向对照：老写法遇到同一个瞬时占用会真的少删一条、且不留任何证据",
+      legacy_removed == 2 and legacy_left == 1 and _err3.getvalue() == "",
+      "removed=%s 剩=%s stderr=%r" % (legacy_removed, legacy_left, _err3.getvalue()[:80]))
+check("11.8 新写法在同样场景下多删的正是老写法漏掉的那条（11.1 复现）",
+      storage.clear_runs() == 1 and storage.list_runs(limit=0)[1] == 0)
+
 os.environ.pop("MAX_UPLOAD_MB", None)
 config.get_settings(refresh=True)
 

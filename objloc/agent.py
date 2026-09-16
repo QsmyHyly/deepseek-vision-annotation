@@ -28,7 +28,7 @@ from typing import Any, Iterator
 
 from objloc.config import get_settings
 from objloc.parsing import decode_json_points, to_items
-from objloc.providers import ChatClient, build_client
+from objloc.providers import ChatClient, build_client, image_part
 from objloc.tools import ToolRegistry, build_default_registry
 
 
@@ -37,9 +37,15 @@ def build_messages(
     *,
     image: str | None = None,
     system_prompt: str | None = None,
+    image_detail: str | None = None,
     history: list[dict] | None = None,
 ) -> list[dict]:
-    """拼装首轮消息列表（system + 可选的图片/文本 user 消息）。"""
+    """拼装首轮消息列表（system + 可选的图片/文本 user 消息）。
+
+    Args:
+        image_detail: 按次覆盖 image_url 的 detail（见 config.IMAGE_DETAILS）；
+            省略时用 Settings.image_detail（config.local.json > IMAGE_DETAIL > 空）。
+    """
     settings = get_settings()
     messages: list[dict] = [
         {"role": "system", "content": system_prompt or settings.system_prompt}
@@ -51,7 +57,7 @@ def build_messages(
         messages.append({
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": image}},
+                image_part(image, image_detail if image_detail is not None else settings.image_detail),
                 {"type": "text", "text": prompt or "请识别图中主要目标并输出坐标。"},
             ],
         })

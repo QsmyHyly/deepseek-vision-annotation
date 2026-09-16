@@ -44,6 +44,7 @@ import json
 import random
 import re
 import shutil
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -539,6 +540,31 @@ def find_source_by_image_id(image_id: str) -> Path | None:
 # --------------------------------------------------------------------------- #
 # 删除 / 保留策略
 # --------------------------------------------------------------------------- #
+def _rmtree_retry(directory: Path, attempts: int = 5) -> bool:
+    """删掉整个目录，返回是否真的删掉了。会短重试几次。
+
+    ⚠️ 为什么不能只写 `shutil.rmtree` + `except OSError: pass`（本机实测踩过）：
+    一次性删二十来条记录时，偶发有几条 rmtree 抛 WinError 32（文件正被杀软扫描、
+    被索引器或前一个请求的读句柄占着），原先那种写法会**静默跳过** ——
+    接口照样返回 200、界面照样说「已清空 22 条」，盘上却剩 5 条。
+    **静默的部分成功比直接失败更难查**，所以这里重试，仍失败就打印到 stderr 并返回 False，
+    由调用方如实记数（API 回给前端的 `removed` 因此是"真删掉的条数"）。
+    """
+    last: OSError | None = None
+    for i in range(attempts):
+        try:
+            shutil.rmtree(directory)
+            return True
+        except FileNotFoundError:
+            return True        # 已经没了（并发删除 / 本来就不在），对调用方来说算成功
+        except OSError as exc:
+            last = exc
+            if i < attempts - 1:
+                time.sleep(0.05 * (i + 1))   # 给占用方一点时间松手
+    print(f"[storage] 删除失败（重试 {attempts} 次后仍被占用？）：{directory}：{last}", file=sys.stderr)
+    return False
+
+
 def delete_run(run_id: str) -> bool:
     """删一条记录（连 runs/history/<run_id>/ 整个目录）；不存在或 run_id 非法返回 False。
 
@@ -550,15 +576,15 @@ def delete_run(run_id: str) -> bool:
     directory = history_dir() / run_id
     if not directory.is_dir():
         return False
-    try:
-        shutil.rmtree(directory)
-    except OSError:
-        return False
-    return True
+    return _rmtree_retry(directory)
 
 
 def clear_runs() -> int:
-    """清空全部历史记录，返回删除条数（不动 uploads/，源图由 gc 负责）。"""
+    """清空全部历史记录，返回**真正删掉**的条数（不动 uploads/，源图由 gc 负责）。
+
+    返回的是实删条数而不是"碰到过几条"：删不掉的会留在盘上，调用方（以及界面上那句
+    「已清空 N 条」）必须能看出来，见 `_rmtree_retry` 的说明。
+    """
     root = history_dir()
     if not root.exists():
         return 0
@@ -566,11 +592,8 @@ def clear_runs() -> int:
     for entry in list(root.iterdir()):
         if not entry.is_dir() or not is_valid_run_id(entry.name):
             continue  # 目录里若有别的东西，不碰
-        try:
-            shutil.rmtree(entry)
+        if _rmtree_retry(entry):
             removed += 1
-        except OSError:
-            pass
     return removed
 
 

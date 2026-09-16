@@ -17,7 +17,7 @@ from typing import Iterator
 from openai import OpenAI
 
 from objloc.config import DEFAULT_SYSTEM_PROMPT, get_settings
-from objloc.providers import build_client
+from objloc.providers import build_client, image_part
 
 
 def _resolve_model(model_id: str | None) -> str:
@@ -111,7 +111,8 @@ def _build_messages(image_url: str | None, prompt: str, sys_prompt: str | None) 
         messages.append({
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": image_url}},
+                # 与 agent.build_messages 共用同一处拼装，避免两条路径的报文慢慢漂移
+                image_part(image_url, get_settings().image_detail),
                 {"type": "text", "text": prompt},
             ],
         })

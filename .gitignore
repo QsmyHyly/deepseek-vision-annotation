@@ -22,6 +22,11 @@ env/
 .env.local
 *.local
 
+# 用户偏好（网页「识别参数」保存的思考模式 / 工具开关 / 工具轮数 / 提示词，见 AGENTS.md §4.10）。
+# ⚠️ 必须单独写一行：上面的 *.local 只匹配以 .local 结尾的文件名，
+#    匹配不到 config.local.json 这种「中间夹 local」的名字。
+config.local.json
+
 # ---- 编辑器 / 操作系统 ----
 .vscode/
 .idea/

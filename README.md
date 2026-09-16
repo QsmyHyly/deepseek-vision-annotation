@@ -21,13 +21,15 @@ deepseek物体定位演示软件/
 ├── .env.example
 ├── README.md
 ├── AGENTS.md                # 项目长期记忆（先读这个）
+├── config.local.json        # 用户偏好（网页「识别参数」保存的值；运行时生成，已 gitignore）
 ├── docs/                    # DeepSeek 官方 API 文档快照
 │   ├── DeepSeek-Chat-Completions-API.md
 │   ├── DeepSeek-Tool-Calls.md
 │   ├── DeepSeek-Thinking-Mode.md   # 思考模式开关 / 强度 / reasoning_content 回传规则
 │   └── DeepSeek-Models-and-Pricing.md  # 模型名 ↔ 版本号对应、为什么只能用 deepseek-flash
 ├── objloc/                  # ★ 核心包
-│   ├── config.py            #   集中配置
+│   ├── config.py            #   集中配置（环境变量 + Settings 单例）
+│   ├── userprefs.py         #   持久化用户偏好：config.local.json 的读写 / 校验 / 优先级
 │   ├── providers.py         #   模型客户端（流式事件协议 + OpenAI 兼容 + 离线 Mock）
 │   ├── client.py            #   客户端门面（stream_chat / infer / 旧签名兼容）
 │   ├── parsing.py           #   坐标 JSON 解析
@@ -198,11 +200,47 @@ python scripts/report.py runs/benchmark/report.json
 | `DEEPSEEK_MODEL` | `deepseek-flash` | 模型名。`deepseek-flash` **就是 DeepSeek-V4.1-Flash**；官方另一档 `deepseek-v4-pro` 不支持图像理解，本项目不能换 |
 | `LLM_PROVIDER` | `auto` | `auto` / `deepseek` / `mock` |
 | `MAX_TOOL_ROUNDS` | `8` | 工具调用最大轮数 |
+| `USE_TOOLS` | `1` | 是否把工具交给模型（`0` 关闭工具执行框架） |
+| `IMAGE_DETAIL` | 空 | 图片输入精度 `low/high/original/auto`（`image_url` 的 `detail`）；空 = 不带该字段 |
 | `REQUEST_TIMEOUT` | `120` | 单次请求超时（秒） |
 | `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `8765` | 网页服务监听地址 |
 | `SYSTEM_PROMPT` | 内置 | 覆盖系统提示词 |
 | `THINKING` | `1` | 思考模式默认开关（`0` 关闭） |
 | `REASONING_EFFORT` | 空 | 思考强度 `low/medium/high/xhigh/max`，空 = 服务端默认 `high` |
+| `MAX_UPLOAD_MB` / `HISTORY_MAX` | `20` / `200` | 单张上传上限（MB，`0`=不限）/ 历史记录保留条数 |
+
+### 5.1 用户偏好：`config.local.json`（长期保存设置）
+
+网页左栏「**识别参数**」里的每一项都是**长期保存**的：换了浏览器、重启了服务也还在，
+还可以直接手改文件。它落在**项目根目录的 `config.local.json`**（已 gitignore，本机私有）：
+
+```jsonc
+{
+  "thinking": true,          // 思考模式开关
+  "reasoning_effort": "low", // 思考强度，空串 = 服务端默认
+  "use_tools": true,         // 工具执行框架开关
+  "max_tool_rounds": 6,      // 工具调用最大轮数（1~64）
+  "image_detail": "low",     // 图片输入精度 low/high/original/auto，空串 = 不带该字段
+  "prompt": "识别图中的主要物体"   // 识别提示词（user 消息）
+}
+```
+
+⚠️ `image_detail` 是 `image_url` 内容块上的 `detail`：`low` 把图缩到 512×512（更快更省 token），
+`high`/`original` 保留原图，`auto` ≈ original。**它不是"提高定位精度"的开关** ——
+官方每张图最多只算 384 token，大图照样会被缩到约 800×800；留空表示**根本不发送这个字段**。
+
+取值优先级（低 → 高）：
+
+```
+内置默认  <  环境变量  <  config.local.json  <  单次请求字段
+```
+
+⚠️ **配置文件排在环境变量之上是刻意的**：这一层代表「用户在网页上点过的选择」，
+环境变量是「部署方的默认值」，点过就该算数。代价是 `THINKING=0` 这类环境变量会被同名键盖住 ——
+想让环境变量重新生效，删掉文件里那一行即可（或用下面 `DELETE /api/settings`）。
+**只认文件里显式出现过的键**，没写的一律回落，所以不生成这个文件时行为与以前完全一致。
+
+保存后**不需要重启服务**：服务端按文件的 mtime 自动重建配置，手改文件同样即时生效。
 
 ---
 
@@ -213,6 +251,9 @@ python scripts/report.py runs/benchmark/report.json
 | GET | `/` | 对比查看页面 |
 | GET | `/api/health` | 运行状态（provider / 工具列表） |
 | GET | `/api/tools` | 已注册工具清单 |
+| GET | `/api/settings` | 用户偏好当前值 / 来源（`file`\|`env`\|`default`）/ 可选范围 / 警告 |
+| PATCH | `/api/settings` | 按 key 部分更新（非法值 400，且**一项都不写**） |
+| DELETE | `/api/settings[?keys=a,b]` | 删掉偏好键 → 回落到环境变量 / 内置默认；省略 `keys` 为全部重置 |
 | POST | `/api/upload` | 上传图片（multipart） |
 | POST | `/api/upload_url` | 通过 URL 登记图片 |
 | POST | `/api/detect` | **SSE 流式识别**（流式输出 + 工具执行 + 标注）；请求体可带 `thinking: true/false` |
@@ -241,7 +282,9 @@ python scripts/report.py runs/benchmark/report.json
 
 ## 7. 坐标约定
 
-模型输出 **0.0~1.0 的相对比例**（`x = 像素x / 图宽`，`y = 像素y / 图高`，保留 3~4 位小数）：
+模型输出 **0.0~1.0 的相对比例**（`x = 像素x / 图宽`，`y = 像素y / 图高`）；
+**小数位数不设上限**（小目标只占画面宽度 0.4% 时，3 位小数会把相对误差放大 6.7%）：
+
 
 ```json
 [

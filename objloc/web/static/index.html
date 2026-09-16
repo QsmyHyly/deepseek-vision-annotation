@@ -14,6 +14,7 @@ DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTM
 @doc README.md#8-思考模式开关     —— thinking / reasoning_effort 的三层开关
 @doc AGENTS.md#4.1-流式事件协议   —— SSE 事件类型与字段名（改后端时要同步这里）
 @doc AGENTS.md#4.3-坐标约定       —— 旧刻度兜底与 coord_space 诊断的由来
+@doc AGENTS.md#4.10-持久化用户偏好configlocaljson —— 识别参数存哪、优先级怎么排
 @doc objloc/samples.py           —— 内置测试图目录（GET /api/samples 的数据源）
 
 --------------------------------------------------------------------------------
@@ -26,7 +27,9 @@ DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTM
   · 顶部告警条（#alertBar）—— 只放「错误 / 告警 / 需要人介入的提示」，写进 DOM 就不会丢。
     旧版把错误混进流式日志，长输出一滚就找不到了，这是本次最重要的可用性修复。
   · 左栏（控制）—— ① 图片源（四个 Tab：本地上传 / 图片 URL / 内置测试图 / 历史记录）
-                     ② 识别参数（提示词 / 工具 / 思考 / 强度 / 发起与取消）
+                     ② 识别参数（提示词 / 工具 / 工具轮数 / 思考 / 强度 / 图片精度 / 发起与取消）
+                        —— 这一卡的每一项都会**长期保存**在服务端 config.local.json，
+                        不随浏览器和重启丢失（接口与优先级见 @doc AGENTS.md#4.10-持久化用户偏好configlocaljson）
                      ③ 手动标注（离线工具，与模型链路无关，故单独成卡）
   · 中栏（对比查看区）—— 主角。占满剩余高度，三种对比模式 + 结果指标条。
   · 右栏（控制台）—— 配角。思考过程 / 正文 / 工具执行三段各自独立、可折叠，
@@ -64,8 +67,11 @@ DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTM
     state.result 结果（annotatedUrl / items / summary / accuracy）
     state.stream 流式计数与"最新一行"
     state.view   纯 UI 偏好（对比模式 / 分隔线位置 / 不透明度 / 缩放平移 / 思考开关 / 左右栏折叠）
+                 ⚠️ 其中只有**纯显示**的那几项进 localStorage；思考 / 工具 / 提示词属于
+                 state.prefs（服务端 config.local.json），见第 12 节与 AGENTS.md#4.10
     state.alerts 顶部告警条的内容栈
     state.history 历史记录面板（懒加载列表 / 总数 / 载入中 / 错误 / 当前正在回看的记录）
+    state.prefs  识别参数的持久化状态（读回来的值 / 来源 / 保存中 / 是否已保存过）
 
 改动状态后调用对应的 renderXxx()，不在事件回调里零散地碰 DOM。
 渲染函数是幂等的：任何时刻重跑一遍都能得到与状态一致的界面。
@@ -299,7 +305,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
 
   /* ---------------- 表单控件 ---------------- */
   label.field { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 5px; }
-  input[type=text], input[type=url], textarea, select {
+  input[type=text], input[type=url], input[type=number], textarea, select {
     width: 100%; background: var(--bg-soft); color: var(--text);
     border: 1px solid var(--line); border-radius: var(--radius-sm);
     padding: 8px 10px; font-family: inherit; font-size: 13px;
@@ -325,6 +331,12 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     accent-color: var(--accent); cursor: pointer;
   }
   .check-row label { cursor: pointer; color: var(--text-dim); }
+  /* 识别参数卡里的分组标题：把「工具调用」「思考模式」「图片输入」分成几段说明，
+     而不是让控件平铺成一串看不出从属关系的勾选框 */
+  .card-sub {
+    color: var(--text-dim); font-size: 11.5px; letter-spacing: .5px;
+    margin: 14px 0 0; padding-top: 10px; border-top: 1px solid var(--line);
+  }
 
   /* Tab：图片源与对比模式共用同一套外观 */
   .tabs { display: flex; gap: 4px; background: var(--bg-soft); padding: 4px; border: 1px solid var(--line); border-radius: 9px; }
@@ -769,15 +781,19 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
       <label class="field" for="prompt">提示词</label>
       <textarea id="prompt" rows="4" placeholder="例如：识别图中所有人物与车辆，输出中文名称">识别图中的主要目标，输出 bbox_2d 坐标与中文名称。</textarea>
 
+      <p class="card-sub">工具调用</p>
       <div class="check-row">
         <input type="checkbox" id="useTools" checked />
         <label for="useTools">工具执行框架（模型请求工具时由后端真正执行）</label>
       </div>
+      <label class="field" for="maxToolRounds">工具调用最大轮数</label>
+      <input type="number" id="maxToolRounds" min="1" max="64" step="1" value="8" />
+
+      <p class="card-sub">思考模式</p>
       <div class="check-row">
         <input type="checkbox" id="thinking" checked />
         <label for="thinking">思考模式（先流式输出思维链，再给正文）</label>
       </div>
-
       <label class="field" for="reasoningEffort">思考强度 reasoning_effort</label>
       <select id="reasoningEffort">
         <option value="">服务端默认（high）</option>
@@ -789,9 +805,26 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
       </select>
       <p class="hint" id="thinkingHint"></p>
 
+      <p class="card-sub">图片输入</p>
+      <label class="field" for="imageDetail">图片精度 detail</label>
+      <select id="imageDetail">
+        <option value="">服务端默认（auto）</option>
+        <option value="low">low（推理前缩到 512×512，更快更省 token）</option>
+        <option value="high">high（保留原图）</option>
+        <option value="original">original（保留原图）</option>
+        <option value="auto">auto（由服务端决定，当前等价 original）</option>
+      </select>
+      <p class="hint">控制服务端把图缩到多大再交给模型。⚠️ 它**不改**坐标口径，也不是「提高定位精度」的开关：
+        官方每张图最多只算 384 token，大图无论如何都会被缩到约 800×800，所以这项主要影响速度与开销。</p>
+
       <div class="row">
         <button class="btn primary" type="button" id="btnDetect" data-role="redetect">▶ 开始识别</button>
         <button class="btn" type="button" id="btnCancel" disabled>■ 取消</button>
+      </div>
+      <!-- 持久化状态：让「改了到底存没存、这个值是谁定的」一眼可见（口径见 AGENTS.md#4.10） -->
+      <p class="status-line" id="prefsStatus" role="status" aria-live="polite">设置加载中…</p>
+      <div class="row">
+        <button class="btn tiny" type="button" id="btnPrefsReset">恢复默认设置</button>
       </div>
       <p class="status-line" id="statusLine" role="status" aria-live="polite">就绪。</p>
     </div>
@@ -954,7 +987,14 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   /* ======================================================================
    * 0. 常量
    * ==================================================================== */
-  const STORE = { thinking: "objloc.thinking", effort: "objloc.effort", mode: "objloc.compareMode" };
+  // 本地记忆只留**纯显示**偏好（对比模式）。识别参数（思考 / 工具 / 图片精度 / 提示词）一律以服务端
+  // config.local.json 为唯一真相，见下面第 12 节 —— 两边各存一份迟早会漂移：
+  // 用户以为自己改的是长期默认值，其实只改了这台浏览器。
+  const STORE = { mode: "objloc.compareMode" };
+  // 工具轮数的兜底值与上下界，和服务端 objloc/userprefs.py 的规格表对齐（超界服务端会拒绝）
+  const MAX_ROUNDS = { def: 8, min: 1, max: 64 };
+  // 图片输入精度（image_url.detail）的合法取值，与 objloc/config.py: IMAGE_DETAILS 保持一致
+  const IMAGE_DETAILS = ["low", "high", "original", "auto"];
   // 用"字面量 id"登记一切需要按状态显隐的元素：渲染函数里只按名字取，不散落字符串
   // history 是第 4 个"源 Tab"：与另外三个共用同一套 data-source 切换机制，
   // 但它不换图，而是回看已存结果（懒加载，见 setSource 与 loadHistory）
@@ -988,8 +1028,8 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     result: { annotatedUrl: null, items: null, summary: null, accuracy: null },
     stream: { latest: "", reasoningChars: 0, contentChars: 0, toolCalls: 0, events: 0 },
     view: {
-      mode: "side", split: 50, opacity: 0.65, thinking: true, effort: "",
-      consoleCollapsed: false, thinkingTouched: false,
+      mode: "side", split: 50, opacity: 0.65, thinking: true, effort: "", detail: "",
+      consoleCollapsed: false,
       // 缩放/平移：zoom = 变换层系数 k，ratio = 显示比例（custom 模式的用户意图），
       // zoomMode = fit/custom；fit 时强制 k=1、平移归零（见文件头「五、缩放 / 平移 / 全屏」）
       zoom: 1, ratio: 1, zoomMode: "fit", panX: 0, panY: 0, leftCollapsed: false,
@@ -1000,6 +1040,12 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     // signature 用来判断"列表内容变没变"——幂等渲染不该每次都重建 innerHTML（缩略图会重新加载）。
     // viewing 是"当前正在回看的记录"，只在 source_url 404 时用于给出更准确的告警。
     history: { loaded: false, loading: false, records: [], total: null, error: null, signature: "", viewing: null },
+    // 识别参数的持久化状态：唯一真相是服务端的 config.local.json（GET / PATCH / DELETE /api/settings）。
+    // touched = 用户本次已经动过控件；首屏那次 GET 回来时不再覆盖他（否则会和用户操作赛跑）。
+    prefs: {
+      loaded: false, saving: false, savedOnce: false, touched: false,
+      path: "", sources: {}, meta: {}, warnings: [], error: null,
+    },
   };
 
   /* ======================================================================
@@ -1311,6 +1357,8 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     $("btnClearAnno").disabled = !state.result.annotatedUrl;
     $("btnFillGt").disabled = !(state.image.groundTruth && state.image.groundTruth.length);
     $("reasoningEffort").disabled = !state.view.thinking;
+    // 关掉工具执行框架之后，轮数这个旋钮就没有意义了：置灰比留着让人白调更清楚
+    $("maxToolRounds").disabled = !$("useTools").checked;
   }
 
   /* ======================================================================
@@ -2120,9 +2168,12 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
           image_id: state.image.id,
           prompt: $("prompt").value,
           use_tools: $("useTools").checked,
+          max_tool_rounds: Number($("maxToolRounds").value) || undefined,
           thinking: state.view.thinking,
           // 关闭思考时 reasoning_effort 不生效，索性不发，免得让人以为它在起作用
           reasoning_effort: state.view.thinking ? state.view.effort : "",
+          // image_url 的 detail：空串 = 不带这个字段（服务端按 auto 处理）
+          image_detail: state.view.detail,
         }),
         signal: controller.signal,
       });
@@ -2167,22 +2218,170 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   }
 
   /* ======================================================================
-   * 12. 用户偏好：思考模式 / 思考强度 / 对比模式
+   * 12. 用户偏好：识别参数（提示词 / 工具 / 工具轮数 / 思考 / 强度 / 图片精度）
+   *
+   * 唯一真相是服务端的 config.local.json（objloc/userprefs.py，口径见 AGENTS.md#4.10）：
+   *   首屏   GET   /api/settings   -> 把值铺回控件，并说明"这个值是谁定的"
+   *   改动   PATCH /api/settings   -> 立刻落盘；服务端按文件 mtime 重建配置，下次识别即生效
+   *   恢复   DELETE /api/settings  -> 删掉键，回落到 环境变量 > 内置默认
+   * 浏览器里不再另存一份：localStorage 只留对比模式这类纯显示偏好。
    * ==================================================================== */
+  const SOURCE_LABEL = { file: "配置文件", env: "环境变量", default: "内置默认" };
+
+  function setPrefsStatus(text, kind) {
+    const el = $("prefsStatus");
+    el.className = "status-line" + (kind ? " " + kind : "");
+    el.textContent = text;
+  }
+  function shortPath(p) {
+    return String(p || "").split(/[\\/]/).pop() || String(p || "");
+  }
+  // 逐项列出"不是从配置文件来的"值：全都来自配置文件时说一句就够，逐项罗列反而是噪音，
+  // 但一旦被环境变量盖住就必须点名 —— 那正是"我明明保存了却没生效"的常见原因。
+  function prefsSourceSuffix() {
+    const sources = state.prefs.sources || {};
+    const meta = state.prefs.meta || {};
+    const parts = [];
+    Object.keys(sources).forEach((key) => {
+      const m = meta[key] || {};
+      if (m.ui === false || sources[key] === "file") return;
+      const via = SOURCE_LABEL[sources[key]] || sources[key];
+      parts.push((m.label || key) + " 来自" + via + (sources[key] === "env" && m.env ? " " + m.env : ""));
+    });
+    return parts.length ? " · " + parts.join(" · ") : "";
+  }
+  function renderPrefs() {
+    if (!state.prefs.loaded) return;          // 还没拉到就别覆盖"设置加载中…"
+    if (state.prefs.error) {
+      setPrefsStatus("设置读取/保存失败：" + state.prefs.error, "err");
+      return;
+    }
+    if (state.prefs.saving) { setPrefsStatus("保存中…", "busy"); return; }
+    const name = shortPath(state.prefs.path);
+    const warn = (state.prefs.warnings || [])[0];
+    const base = state.prefs.savedOnce
+      ? "已保存到 " + name + "，下次识别立即生效"
+      : "识别参数长期保存在 " + name + "（重启服务、换浏览器都还在）";
+    setPrefsStatus(base + prefsSourceSuffix() + (warn ? " · ⚠ " + warn : ""), warn ? "warn" : "ok");
+    $("prefsStatus").title = [
+      "配置文件：" + state.prefs.path,
+      warn ? "警告：" + warn : "",
+    ].filter(Boolean).join("\n");
+  }
+  // 把服务端返回的快照铺回控件。用户已经动过的控件不覆盖 —— 首屏那次 GET 与他可能同时发生
+  function applyPrefs(data) {
+    state.prefs.loaded = true;
+    state.prefs.error = null;
+    state.prefs.path = data.path || "";
+    state.prefs.sources = data.sources || {};
+    state.prefs.meta = data.meta || {};
+    state.prefs.warnings = data.warnings || [];
+    const v = data.values || {};
+    if (!state.prefs.touched) {
+      $("prompt").value = v.prompt || "";
+      setUseTools(v.use_tools !== false, false);
+      setMaxRounds(v.max_tool_rounds, false);
+      setThinking(v.thinking !== false, false);
+      setEffort(v.reasoning_effort || "", false);
+      setImageDetail(v.image_detail || "", false);
+    }
+    renderPrefs();
+  }
+  async function loadPrefs() {
+    try {
+      const resp = await fetch("/api/settings");
+      if (!resp.ok) throw new Error(await readError(resp));
+      applyPrefs(await resp.json());
+    } catch (e) {
+      state.prefs.loaded = true;
+      state.prefs.error = e.message;
+      renderPrefs();
+      pushAlert("warn", "读取识别参数失败（" + e.message + "）：本次改动只在当前页面有效，刷新就没了。");
+    }
+  }
+  async function savePrefs(patch) {
+    state.prefs.touched = true;
+    state.prefs.saving = true;
+    renderPrefs();
+    let ok = false;
+    try {
+      const resp = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!resp.ok) throw new Error(await readError(resp));
+      applyPrefs(await resp.json());
+      ok = true;
+    } catch (e) {
+      state.prefs.error = e.message;
+      pushAlert("error", "保存识别参数失败：" + e.message);
+    } finally {
+      state.prefs.saving = false;
+      if (ok) state.prefs.savedOnce = true;
+      renderPrefs();
+    }
+  }
+  async function resetPrefs() {
+    state.prefs.saving = true;
+    renderPrefs();
+    try {
+      const resp = await fetch("/api/settings", { method: "DELETE" });
+      if (!resp.ok) throw new Error(await readError(resp));
+      const data = await resp.json();
+      // 复位后允许服务端值重新铺回控件（否则用户刚点过的控件会一直挡住）
+      state.prefs.touched = false;
+      applyPrefs(data);
+      state.prefs.savedOnce = false;
+      pushAlert("info", "已恢复默认设置：删掉了 " + shortPath(data.path) +
+                        " 里的键，当前值回落到环境变量 / 内置默认。");
+    } catch (e) {
+      state.prefs.error = e.message;
+      pushAlert("error", "恢复默认设置失败：" + e.message);
+    } finally {
+      state.prefs.saving = false;
+      renderPrefs();
+    }
+  }
+
+  // 下面四个 setXxx(on, persist)：persist=true 表示这次是**用户操作**，要落盘；
+  // 铺初值时传 false，否则"读回来的值"会被立刻当成"用户改的值"再写回去一遍。
   function setThinking(on, persist) {
     state.view.thinking = !!on;
-    if (persist) state.view.thinkingTouched = true;
     $("thinking").checked = state.view.thinking;
     $("thinkingHint").textContent = state.view.thinking
       ? "开启：先流式输出思维链（reasoning_content）再给正文，复杂推理更稳，但更慢、更耗 token（实测同批基准图约 4.9 s）。"
       : "关闭：模型直接给正文。实测同批基准图快约 2.2 倍（4.9 s → 2.2 s）且准确率不降；此时 reasoning_effort 不生效。";
-    $("reasoningEffort").disabled = !state.view.thinking;
-    if (persist) writeStore(STORE.thinking, state.view.thinking ? "1" : "0");
+    renderControls();
+    if (persist) savePrefs({ thinking: state.view.thinking });
   }
   function setEffort(value, persist) {
     state.view.effort = value || "";
     $("reasoningEffort").value = state.view.effort;
-    if (persist) writeStore(STORE.effort, state.view.effort);
+    renderControls();
+    if (persist) savePrefs({ reasoning_effort: state.view.effort });
+  }
+  // 图片精度：只认四个合法值（与 objloc/config.py: IMAGE_DETAILS 一一对应），
+  // 空串 = 不发这个字段。这里不报错而是静默回落，理由同后端 _pick_detail。
+  function setImageDetail(value, persist) {
+    const v = String(value || "").toLowerCase();
+    state.view.detail = IMAGE_DETAILS.indexOf(v) >= 0 ? v : "";
+    $("imageDetail").value = state.view.detail;
+    if (persist) savePrefs({ image_detail: state.view.detail });
+  }
+  function setUseTools(on, persist) {
+    $("useTools").checked = !!on;
+    renderControls();
+    if (persist) {
+      savePrefs({ use_tools: !!on });
+      if (!on) pushAlert("info", "已关闭工具执行框架：模型这次不会被提供任何工具，坐标解析全靠它自己按约定输出。");
+    }
+  }
+  function setMaxRounds(value, persist) {
+    const n = Number(value);
+    const safe = Number.isFinite(n) ? clamp(Math.round(n), MAX_ROUNDS.min, MAX_ROUNDS.max) : MAX_ROUNDS.def;
+    $("maxToolRounds").value = String(safe);
+    if (persist) savePrefs({ max_tool_rounds: safe });
   }
 
   /* ======================================================================
@@ -2262,11 +2461,14 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
         badge.textContent = h.provider + " · " + h.model;
       }
       badge.title = "provider=" + h.provider + " · model=" + h.model + " · base_url=" + h.base_url +
-                    " · 思考模式默认=" + h.thinking + " · reasoning_effort=" + h.reasoning_effort;
+                    " · 思考模式默认=" + h.thinking + " · reasoning_effort=" + h.reasoning_effort +
+                    " · 图片精度=" + h.image_detail +
+                    " · 工具=" + (h.use_tools === false ? "关" : "开") + " / 最多 " + h.max_tool_rounds + " 轮";
       $("toolsBadge").textContent = "工具 " + h.tools.length + " 个";
       $("toolsBadge").title = h.tools.join("\n");
-      // 思考开关初值：优先用户上次的选择，其次服务端默认（THINKING 环境变量）
-      if (!state.view.thinkingTouched) setThinking(h.thinking !== false, false);
+      // 思考开关 / 工具开关的初值**不在这里定**：它们由 loadPrefs() 从 config.local.json 铺回来
+      // （见第 12 节）。两处都去设控件就会互相打架，且谁最后返回谁说了算，无法排查。
+      // health 里的这几个字段现在只用于下面这行 tooltip 和状态徽章。
     } catch (e) {
       badge.className = "badge err";
       badge.textContent = "服务未就绪";
@@ -2336,6 +2538,12 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     $("btnCancel").addEventListener("click", onCancelClick);
     $("thinking").addEventListener("change", (e) => setThinking(e.target.checked, true));
     $("reasoningEffort").addEventListener("change", (e) => setEffort(e.target.value, true));
+    $("imageDetail").addEventListener("change", (e) => setImageDetail(e.target.value, true));
+    $("useTools").addEventListener("change", (e) => setUseTools(e.target.checked, true));
+    $("maxToolRounds").addEventListener("change", (e) => setMaxRounds(e.target.value, true));
+    // 提示词用 change（失焦才触发）而不是 input：逐字上报会把文件写爆，也没人想每敲一个字存一次盘
+    $("prompt").addEventListener("change", (e) => savePrefs({ prompt: e.target.value }));
+    $("btnPrefsReset").addEventListener("click", resetPrefs);
     $("prompt").addEventListener("keydown", (e) => {
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); startDetect(); }
     });
@@ -2391,10 +2599,12 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   }
 
   function init() {
-    // 用户偏好恢复：先按本地记忆渲染，/api/health 回来后只补"没被用户改过"的默认值
-    const savedThinking = readStore(STORE.thinking);
-    setThinking(savedThinking === null ? true : savedThinking === "1", false);
-    setEffort(readStore(STORE.effort) || "", false);
+    // 识别参数：先按内置默认渲染一帧（避免首屏出现半空的控件），真正的值由 loadPrefs() 铺回来。
+    // 这里刻意不读 localStorage —— 唯一真相是服务端 config.local.json（见第 12 节）。
+    setUseTools(true, false);
+    setMaxRounds(MAX_ROUNDS.def, false);
+    setThinking(true, false);
+    setEffort("", false);
     const savedMode = readStore(STORE.mode);
     setMode(savedMode && MODE_TABS[savedMode] ? savedMode : "side", false);
     setSource("sample");
@@ -2416,6 +2626,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     if (window.ResizeObserver) new ResizeObserver(() => applyZoom()).observe($("cmpStage"));
     window.addEventListener("resize", scheduleSyncFrame);
     loadHealth();
+    loadPrefs();
     loadSampleCatalog();
   }
 
