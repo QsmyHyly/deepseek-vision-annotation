@@ -46,9 +46,10 @@ deepseek物体定位演示软件/
 ├── scripts/
 │   ├── benchmark.py         # 评测 CLI：生成图片 + 调模型 + 出报告
 │   ├── report.py            # 美化打印评测报告
-│   └── compare_thinking.py  # 思考模式 A/B 对照（开/关各跑一遍比准确率与耗时）
-├── examples/
-│   └── demo_2d.py           # 旧脚本函数名兼容层
+│   ├── compare_thinking.py  # 思考模式 A/B 对照（开/关各跑一遍比准确率与耗时）
+│   ├── probe_vision_frame.py    # 探测模型实际看到的画面几何（缩放 / 补边 / 最小可读字号）
+│   ├── verify_gt.py             # 独立复核：从渲染好的 PNG 像素重量包围盒，验证真值本身没错
+│   └── capture_web_samples.mjs  # 第 ⑤ 组网页截图的唯一生成源（Playwright 渲染 + DOM 真值）
 ├── tests/                   # 自测
 │   ├── test_parser.py       #   纯离线，不花 API、不需要服务
 │   ├── test_e2e.py

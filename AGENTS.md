@@ -94,7 +94,6 @@ objloc/                      ★核心包
   web/
     app.py                   FastAPI：图片管理 + SSE 流式接口 + 静态页
     static/index.html        ★打标前后对比页面（原生 JS）
-examples/demo_2d.py          旧脚本函数名兼容层（原 deepseek41-vl-2d.py）
 scripts/
   benchmark.py               ★打标准确率评测 CLI（生成图片 + 调模型 + 出报告）
   capture_web_samples.mjs    ★第 ⑤ 组「网页截图」的唯一生成源：Playwright 渲染仿真网页 →
