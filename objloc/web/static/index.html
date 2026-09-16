@@ -549,9 +549,13 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   .cmp.overlay-mode .slider-line,
   .cmp.overlay-mode .slider-handle { display: none; }
 
-  /* 结果指标条 */
-  .resultbar { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; }
-  .metrics { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 12px; }
+  /* 结果指标条。⚠️ 这三个盒子是一条"必须能逐级让出空间"的 flex 链：
+     .resultbar(flex:0 1 auto) → .detail(flex:0 1 auto) → .detail-body(flex:0 1 auto)，
+     每一级都要显式 min-height:0；只要有一级留着 min-height:auto，链条就被顶死，
+     矮屏下明细面板底部会被 .col-center 的 overflow:hidden 裁掉 —— 表现为"滚到底也看不到最后一个目标"
+     （复现见 runs/probe_detail_geom.mjs）。 */
+  .resultbar { flex: 0 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+  .metrics { flex: 0 0 auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 12px; }
   .metric {
     display: flex; align-items: baseline; gap: 6px; padding: 5px 10px;
     background: var(--bg-soft); border: 1px solid var(--line-soft); border-radius: 999px;
@@ -561,12 +565,29 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   .metric-v.ok { color: var(--ok); }
   .metric-v.warn { color: var(--warn); }
   .metric-v.bad { color: var(--err); }
+  /* ⚠️ 面板用 <div> + <button> 自己实现折叠，别换回 <details>/<summary>：
+     Chrome 把 <details> 的内容包在 ::details-content 里，summary 与 .detail-body 都不是它的
+     直接 flex 项，上面的 min-height:0 链条断在中间，矮屏下只能靠硬裁。 */
   .detail {
+    flex: 0 1 auto; min-height: 0; overflow: hidden;
+    display: flex; flex-direction: column;
     border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--bg-soft);
     padding: 6px 10px;
   }
-  .detail > summary { cursor: pointer; color: var(--text-dim); font-size: 12.5px; }
-  .detail-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; max-height: 34vh; overflow: auto; }
+  .detail-head {
+    flex: 0 0 auto; width: 100%; display: flex; align-items: center; gap: 6px;
+    background: none; border: 0; padding: 0; cursor: pointer; text-align: left;
+    font: inherit; font-size: 12.5px; color: var(--text-dim);
+  }
+  .detail-head:hover { color: var(--text); }
+  .detail-head::before { content: "▸"; font-size: 10px; line-height: 1; transition: transform .15s ease; }
+  .detail-head[aria-expanded="true"]::before { transform: rotate(90deg); }
+  /* min-height 是"矮屏下不至于被压没"的下限；超出部分由 max-height + overflow 自己滚。 */
+  .detail-body {
+    flex: 0 1 auto; min-height: 72px; margin-top: 8px;
+    display: flex; flex-direction: column; gap: 8px; max-height: 34vh; overflow: auto;
+  }
+  .detail-body[hidden] { display: none; }
   .coord-space { font-size: 12px; padding: 6px 9px; border-radius: 7px; border: 1px solid var(--line); color: var(--muted); }
   .coord-space.ok { border-color: rgba(61, 220, 151, .4); color: var(--ok); background: rgba(12, 40, 30, .5); }
   .coord-space.warn { border-color: rgba(247, 185, 85, .45); color: var(--warn); background: rgba(58, 44, 16, .5); }
@@ -868,14 +889,15 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
 
       <div class="resultbar">
         <div class="metrics" id="metricsBox" aria-live="polite">尚未识别。</div>
-        <details class="detail" id="detailBox">
-          <summary>逐目标明细 · 坐标空间诊断 · 识别到的目标</summary>
-          <div class="detail-body">
+        <div class="detail">
+          <button class="detail-head" type="button" id="btnToggleDetail"
+                  aria-expanded="false" aria-controls="detailBody">逐目标明细 · 坐标空间诊断 · 识别到的目标</button>
+          <div class="detail-body" id="detailBody" hidden>
             <div class="coord-space" id="coordSpace">载入带真值的内置测试图并完成识别后，这里给出 coord_space 诊断。</div>
             <ul class="per-target" id="perTarget"></ul>
             <ul class="item-list" id="resultList"></ul>
           </div>
-        </details>
+        </div>
       </div>
     </div>
   </section>
@@ -1625,6 +1647,11 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     return '<span class="metric"><span class="metric-k">' + label + "</span>" +
            '<span class="metric-v ' + levelOf(name, value) + '">' + text + "</span></span>";
   }
+  // 明细面板默认收起：识别完不强行展开，免得把对比区挤小；用户点标题或「填入真值」时才展开。
+  function setDetailOpen(open) {
+    $("btnToggleDetail").setAttribute("aria-expanded", open ? "true" : "false");
+    $("detailBody").hidden = !open;
+  }
   function renderResult() {
     const res = state.result;
     const box = $("metricsBox");
@@ -1899,7 +1926,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     const gt = state.image.groundTruth;
     if (!gt || !gt.length) { pushAlert("warn", "当前图片没有坐标真值（只有内置测试图才带真值）。"); return; }
     $("manualJson").value = JSON.stringify(gt, null, 2);
-    if ($("detailBox")) $("detailBox").open = true;
+    setDetailOpen(true);
     setStatus("真值已填入标注框，点「应用标注」即可画出标准答案。", "ok");
   }
   function clearAnnotation() {
@@ -2338,6 +2365,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     $("btnToggleReasoning").addEventListener("click", () => toggleSection("btnToggleReasoning", "logReasoning"));
     $("btnToggleContent").addEventListener("click", () => toggleSection("btnToggleContent", "logContent"));
     $("btnToggleTools").addEventListener("click", () => toggleSection("btnToggleTools", "logTools"));
+    $("btnToggleDetail").addEventListener("click", () => setDetailOpen($("detailBody").hidden));
 
     // ---- 叠加不透明度 ----
     $("opacity").addEventListener("input", (e) => {

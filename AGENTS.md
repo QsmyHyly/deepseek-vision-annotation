@@ -285,6 +285,17 @@ DeepSeek 默认先输出思维链（`reasoning_content`）再给正文。本项�
   那是**恒真断言**，正是它漏掉了上面那个真 bug；量可见区域必须三重相交：图片 ∩ 窗格 ∩ 对比区。
 - **提示分层**（别把三类信息混在一起）：错误 / 告警 → 顶部 `#alertBar`（可关闭、带详情，
   不会被日志冲走）；操作进度 → 左栏 `#statusLine`；模型输出 → 右栏三段可折叠控制台。
+- ⚠️ **中栏底部的结果条是一条"必须能逐级让出空间"的 flex 链**：`.col-center` 是定高且
+  `overflow:hidden` 的容器，`.cmp` 又有 `min-height:300px` 不退让，所以
+  `.resultbar → .detail → .detail-body` **每一级都要显式 `min-height:0` + `flex:0 1 auto`**，
+  否则「逐目标明细」展开后底部会被裁掉 —— 表现为**列表能滚、但滚到底也看不到最后一个目标**
+  （1366×768 裁 19px、1280×720 裁 50px，复现脚本 `runs/probe_detail_geom.mjs`）。
+  ⚠️ 面板**不能换回 `<details>/<summary>`**：Chrome 把 `<details>` 的内容包在 `::details-content` 里，
+  summary 与 body 都不是它的直接 flex 项，`min-height:0` 传不下去，只能靠硬裁。
+  现为 `<div class="detail">` + `<button id="btnToggleDetail" aria-expanded aria-controls="detailBody">`
+  + `<div id="detailBody" hidden>`，由 `setDetailOpen()` 统一开关。
+  验收：`node runs/verify_detail_scroll.mjs`（4 种视口 × 10 条断言）；加 `--control` 打回修复前的几何，
+  必须**故意失败**才算断言有效（负向对照）。
 - **改完必须跑**：`node --check`（抽 script 块）+ `python tests/ui/check_frontend_contract.py`
   + `node tests/ui/ui_check.mjs`，命令见第 5 节。
 
