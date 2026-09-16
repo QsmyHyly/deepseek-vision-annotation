@@ -308,7 +308,7 @@ DeepSeek 默认先输出一段思维链（`reasoning_content`）再给正文。�
 
 | 入口 | 用法 |
 |---|---|
-| 网页 | 左栏「② 识别参数」卡片里的 **思考模式** 勾选框与 **思考强度** 下拉（选择记在浏览器本地） |
+| 网页 | 左栏「② 识别参数」卡片里的 **思考模式** 勾选框与 **思考强度** 下拉（选择长期保存在 `config.local.json`，见 5.1） |
 | API | `POST /api/detect` 的 `thinking` 字段（`true`/`false`，省略则用服务端默认） |
 | CLI | `python main.py detect --no-thinking`、`--thinking --reasoning-effort low` |
 | 评测 | `python scripts/benchmark.py --no-thinking` |
@@ -335,3 +335,12 @@ python scripts/compare_thinking.py --samples marker_900 --repeat 2
 > 密集小目标、需要推理比较的难任务建议保留思考模式。
 
 > ⚠️ 换模型 / 换服务商前请先验证该模型是否支持 `thinking` 参数，不要假设通用。
+
+---
+
+## 9. 许可证
+
+本项目以 [MIT License](./LICENSE) 开源。
+
+`docs/` 下的 DeepSeek 官方 API 文档快照版权归 DeepSeek 所有，仅为方便离线查阅而收录，
+不在本项目的 MIT 授权范围内；以官方站点 <https://api-docs.deepseek.com> 为准。
