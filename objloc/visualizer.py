@@ -21,7 +21,7 @@ from typing import Any, Iterable
 import requests
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
-from objloc.config import RUNS_DIR
+from objloc.config import SCRATCH_DIR
 from objloc.parsing import normalize_to_unit
 
 # 手写色优先，其后追加 PIL 命名颜色并去重（保持首次出现顺序）
@@ -260,9 +260,16 @@ def render_annotations(
     output_dir: Path | None = None,
     stem: str | None = None,
 ) -> tuple[Image.Image, Path]:
-    """绘制标注并保存为 PNG，返回 (标注图, 保存路径)。"""
+    """绘制标注并保存为 PNG，返回 (标注图, 保存路径)。
+
+    ⚠️ **不传 output_dir 就落到 runs/scratch/，不要往 runs/ 根目录写**：
+    根目录曾经被三处调用方（main.py、tools/builtin.py、web/app.py）倒进 162 张随机命名的散图，
+    既不可清理也反查不回来源。无归属的临时标注图一律去 scratch/；
+    要长期留存就显式指定 storage.run_dir(run_id) + stem="annotated" 走历史记录
+    （见 AGENTS.md#4.9-上传--结果存储--历史记录）。
+    """
     img = annotate(image_source, items)
-    out_dir = Path(output_dir or RUNS_DIR)
+    out_dir = Path(output_dir or SCRATCH_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     name = stem or f"annotated_{uuid.uuid4().hex[:12]}"
     path = out_dir / f"{name}.png"

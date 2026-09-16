@@ -37,6 +37,8 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 - ✅ **思考模式可开关**（见 4.6）：网页勾选框 / `main.py detect --no-thinking` / `THINKING=0`。
   实测同批基准图：思考开 4.9s / 思考关 2.2s，检出率与标签准确率都是 100%，
   平均 IoU 0.842 → 0.873（`scripts/compare_thinking.py`，报告在 `runs/thinking_ab/`）。
+- ✅ **上传/结果存储/历史记录**：每次打标落 `runs/history/<run_id>/`（meta.json + annotated.png），
+  服务重启后仍可查；见 §4.9。
 - ✅ 未配置 Key 时自动降级为**离线 Mock**，保证零配置可演示。
 - ✅ 网页截图组实测（第 ⑤ 组，4 图 28 目标）：**检出率 100%、平均 IoU 0.856、标签准确率 97%**，
   关掉思考同样 100% 检出、耗时减半（详见第 7 节）。
@@ -113,7 +115,12 @@ tests/                       自测
     ui_check.mjs                真实浏览器驱动页面，交互与几何断言（离线，但需要服务在跑）
     ui_check_detect.mjs         浏览器端真实 SSE 全链路（花 API）
     smoke_detect.py             HTTP 层 SSE 冒烟（花 API）
-runs/                        运行产物（uploads、benchmark、标注图、web 日志）
+runs/                        运行产物；**根目录只放子目录与日志，不放散图**（见 4.9）
+  uploads/                   源图（统一转 PNG，文件名 <image_id>.png，原名记在 meta 里）
+  samples/ web_samples/      内置测试图 / 网页截图组（见 §7）
+  scratch/                   无归属的临时标注图（CLI detect、模型调的 annotate_image）
+  history/<run_id>/          打标记录：meta.json + annotated.png（唯一的持久化入口）
+  benchmark*/ thinking_ab*/ web_ab/ vision_probe/ ui/   评测与自检产物（见 §7）
 ```
 
 数据流：`web/app.py` → `objloc.agent.run_agent` →（`providers.stream_chat` 流式事件 ↔
@@ -285,6 +292,106 @@ DeepSeek 默认先输出思维链（`reasoning_content`）再给正文。本项�
 - **文档挪动锚点时必须同步全仓库的 `@doc` 引用**，并在注释里保留旧锚点的迁移说明。
 - 这条约定由 `tests/test_docrefs.py` 兜底（离线）：校验目标文件存在、`docs/` 无孤儿文档、
   锚点能对上标题。改了文档或引用的位置，跑一次就知道有没有断。
+
+---
+
+### 4.9 上传 / 结果存储 / 历史记录
+
+**目录布局**（`RUNS_DIR = 项目根/runs`，见 `objloc/config.py`）。根目录**只放子目录与日志，不放散图**：
+
+```
+runs/
+  uploads/        源图。统一转成 PNG，文件名 <image_id>.png（原始文件名记在 meta 里）
+  samples/        内置测试图（objloc/samples.py 现场生成，见 §7）
+  web_samples/    网页截图组（scripts/capture_web_samples.mjs 产出，见 §7）
+  scratch/        ★ 无归属的临时标注图：CLI detect、模型自己调的 annotate_image 工具落这里
+  history/        ★ 唯一的持久化入口：每次打标一条记录
+    <run_id>/
+      meta.json     记录元数据（见下）
+      annotated.png 标注图
+  benchmark*/ thinking_ab*/ web_ab/ vision_probe/ ui/   评测与自检产物（见 §7）
+```
+
+- **run_id** = `YYYYMMDD-HHMMSS-<6位hex>`，**字典序即时间序**（列表排序、保留策略都靠它）。
+- ⚠️ **`render_annotations` 的默认目录是 `runs/scratch/`，不是 `RUNS_DIR` 根**；
+  历史记录走显式的 `output_dir=history/<run_id>/` + `stem="annotated"`。
+  改这里是因为根目录曾被三处调用方（`main.py`、`tools/builtin.py`、`web/app.py`）倒进 162 张散图。
+- ⚠️ **打标的结构化数据必须落盘**：历史记录之前只有一张 PNG，坐标/标签/提示词/准确率全在内存里，
+  重启即失，PNG 也反查不回任何来源 —— 那叫产物，不叫记录。`meta.json` 是唯一真相来源。
+
+**`meta.json` schema v1**（时间用本地时间 ISO，路径用**相对项目根的正斜杠**，换机器/挪目录仍可解析）：
+
+```jsonc
+{
+  "schema": 1,
+  "run_id": "20260916-163512-a1b2c3",
+  "created_at": "2026-09-16T16:35:12",
+  "kind": "detect",                  // detect（调模型）| annotate（本地给定坐标）
+  "source": {
+    "image_id": "087ba960a8b4",
+    "filename": "原始文件名.png",       // 用户上传时的原名，不因落盘改名而丢
+    "path": "runs/uploads/087ba960a8b4.png",
+    "width": 900, "height": 720,
+    "sha256": "...",                   // 源图像素级指纹（暂不做去重，先留证据）
+    "sample_id": null                 // 内置测试图才有，用于回看真值
+  },
+  "prompt": "识别主要目标",
+  "thinking": true,                   // 见 §4.6
+  "reasoning_effort": null,
+  "model": "deepseek-flash",
+  "duration_ms": 4900,                 // detect 为整轮耗时；annotate 为 null
+  "items": [{"bbox_2d": [0.1, 0.2, 0.3, 0.4], "label": "..."}],
+  "summary": {"total": 2, "bbox_count": 2, "point_count": 0},
+  "accuracy": null,                    // 内置测试图才有，见 §7
+  "warnings": [],                      // 旧刻度换算 / 坐标越界等，原样留档
+  "notice": null,
+  "app_version": "2.0"
+}
+```
+
+**HTTP 接口**（`objloc/web/app.py`）。列表**不带 `items`**（一次几十条会撑爆响应），单条才带全文：
+
+```
+GET    /api/history?limit=50&offset=0&q=<子串>   列表，按 created_at 倒序
+GET    /api/history/{run_id}                     单条完整记录（= meta.json + 下列 url 字段）
+DELETE /api/history/{run_id}                     删一条（连 runs/history/<run_id>/ 整个目录）
+DELETE /api/history                              清空全部
+POST   /api/history/gc                           清理孤儿源图（见下）
+GET    /api/history/{run_id}/annotated[?w=160]   标注图；带 w 时现场缩成缩略图
+GET    /api/history/{run_id}/source              源图
+```
+
+列表响应：`{"records": [...], "total": N, "limit": L, "offset": O, "max_records": 200}`。
+列表项字段 = meta 里的 `run_id/created_at/kind/prompt/thinking/model/duration_ms/summary/accuracy`
++ `source` 的子集（`image_id/filename/width/height`）+ `n_items`
++ 三个 URL：`annotated_url` / `source_url` / `thumb_url`（= `annotated?w=160`）。
+
+- **`?w=` 缩略图现场缩放 + 内存 LRU**（缓存键含 mtime），**不落盘** —— 落盘又会堆一堆没人清理的文件。
+  列表几十条时缩略图是必要的（原标注图可能 2 MB，全量加载会很慢）。
+- **持久化不是「存下来」，是「重启后还能读回来」**：`GET /api/history` 每次从 `runs/history/*/meta.json` 现场扫盘。
+  验收必须包含**重启服务再查**这一步，只在进程内跑通不算数。
+- **保留策略**：`HISTORY_MAX`（默认 200，`0` = 不限），每次新增记录后按 `run_id` 删最老的。
+  这是防「只增不减」的闸门 —— 原来根目录 162 张散图就是这么攒出来的。
+
+**上传侧的三条硬约束**（`POST /api/upload` / `_register_image`）：
+1. **大小上限**：`MAX_UPLOAD_MB`（默认 20，`0` = 不限）。边写边累计字节，超限立刻中断、**删掉已写的临时文件**、回 413。
+2. **内容校验，不只信后缀**：后缀白名单只是第一道；落盘后必须用 `load_image` **真正解码一次**，
+   解不开就**删文件 + 400**。原来只查后缀，`.txt` 改名成 `.png` 能落盘，等 `load_image` 报错时文件已经留下了。
+3. **统一转 PNG 落盘**：`uploads/<image_id>.png`，临时文件用完即删。原来上传按原后缀存、URL 路径强转 PNG，
+   两条路径行为不一致。原始文件名记进 `meta.source.filename`，不因落盘改名而丢。
+
+- **孤儿源图 = 既不在 `IMAGES` 内存表、又不被任何 history 记录的 `source.path` 引用**的 uploads 文件。
+  `POST /api/history/gc` 才清，返回 `{removed, freed_bytes}`。
+  ⚠️ **不要在启动时自动清**：刚上传、还没打标的图也满足「无引用」，自动清会把用户刚传的图删掉。
+
+**向后兼容**：`GET /api/file/{image_id}` 与 `GET /api/result/{name}` 保留；
+`/api/result/{name}` 现在查 `runs/scratch/` 与 `runs/` 根 —— CLI `detect` 与模型的 `annotate_image`
+工具只在终端打印本地路径，靠这个路由才能把文件名拼成 URL 在浏览器里看。
+⚠️ **不能只查 `runs/` 根**：根目录已经不再写图，那样它会是一条永远 404 的死路由；
+`/api/detect` / `/api/annotate` 返回体里的标注图 URL 改指历史记录（`/api/history/<run_id>/annotated`）。
+
+**改完必须跑**：`python tests/test_storage.py`（新增，离线）+ 现存 5 个离线测试 + `python tests/ui/check_frontend_contract.py`。
+历史面板的浏览器断言在 `tests/ui/ui_check.mjs` 里，见 4.7。
 
 ---
 
@@ -482,6 +589,8 @@ python scripts\verify_gt.py runs\benchmark_v2_hard\images # 10 图 × 4 图形
 - [ ] 评测：加入更多干扰（重叠图形、背景纹理、旋转文字、密集小目标），以及"点定位"精度评测。
 - [ ] 评测：支持 A/B 多提示词自动对比（已有 `--system-prompt`，可再写批量脚本）。
 - [ ] 前端：对比模式增加"差异高亮"、标注列表点选定位（缩放 / 平移 / 全屏已完成，见 4.7）。
-- [ ] 后端：会话/历史持久化（当前 `IMAGES` 为进程内内存字典，重启即失）。
+- [x] 后端：**打标记录的持久化**（完成于 §4.9）：每次打标落 `runs/history/<run_id>/`，
+  服务重启后仍可查、可看原图。⚠️ 范围要说清：`IMAGES`（当前选中的图片这一会话态）**仍然是
+  进程内内存字典**，重启后要重新上传/重新载入图片；持久化的只是打标记录本身，不是整个会话。
 - [ ] 工具：增加 `crop_image`、`zoom_region` 等二次观察工具，让 agent "放大再看"。
 - [ ] 支持多图 / 批量打标对比。

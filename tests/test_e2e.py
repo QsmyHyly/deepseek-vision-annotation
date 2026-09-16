@@ -24,9 +24,22 @@ def check(name, cond, extra=""):
 
 
 # ---------------------------------------------------------------- 1. 标注
+# ⚠️ 测试产物一律落 tempfile 临时目录：以前这里往 runs/ 根目录写 e2e_annotated.png，
+# 和 CLI / Web 的散图一起把 runs/ 堆成了垃圾场（见 AGENTS.md#4.9）。
+import tempfile
+from pathlib import Path
+
 from PIL import Image
-from objloc.config import RUNS_DIR
 from objloc.visualizer import annotate, load_image, render_annotations, summarize
+
+_TMPDIR = Path(tempfile.mkdtemp(prefix="objloc_e2e_"))
+
+# render_annotations 的默认目录（runs/scratch/）也一并指到临时目录：
+# 下面用工具 annotate_image 跑端到端时它不传 output_dir，走的就是这个默认值，
+# 不指走的话测试每跑一次就往项目的 runs/scratch 里丢一张 PNG。
+import objloc.visualizer as _visualizer   # noqa: E402
+
+_visualizer.SCRATCH_DIR = _TMPDIR
 
 img = Image.new("RGB", (600, 400), (250, 250, 250))
 # 坐标约定是 0.0~1.0 相对比例（见 AGENTS.md#4.3）；
@@ -35,7 +48,7 @@ items = [
     {"bbox_2d": [0.1, 0.1, 0.4, 0.3], "label": "目标 A"},
     {"point_2d": [0.5, 0.2], "label": "点位"},
 ]
-annotated, path = render_annotations(img, items, output_dir=RUNS_DIR, stem="e2e_annotated")
+annotated, path = render_annotations(img, items, output_dir=_TMPDIR, stem="e2e_annotated")
 check("annotate saves png", path.exists() and path.stat().st_size > 0, path)
 check("annotate keeps size", annotated.size == (600, 400))
 check("summary counts", summarize(items) == {"total": 2, "bbox_count": 1, "point_count": 1, "labels": ["目标 A", "点位"]})
@@ -116,11 +129,15 @@ check("GET /api/file", r.status_code == 200 and r.headers["content-type"].starts
 # 手动标注
 r = client.post("/api/annotate", json={"image_id": image_id, "items": items})
 check("POST /api/annotate", r.status_code == 200, r.text[:300])
-check("annotate returns url", r.json().get("annotated_url", "").startswith("/api/result/"), r.json())
-annotated_url = r.json()["annotated_url"]
+# 标注图 URL 已改指历史记录：/api/history/<run_id>/annotated（见 AGENTS.md#4.9）。
+# 这里锁的是「指向历史记录 + 末尾就是 annotated」这两点，而不是旧的 /api/result/。
+annotated_url = r.json().get("annotated_url", "")
+check("annotate returns history url",
+      annotated_url.startswith("/api/history/") and annotated_url.split("?")[0].endswith("/annotated"),
+      r.json())
 
 r = client.get(annotated_url.split("?")[0])
-check("GET /api/result", r.status_code == 200 and len(r.content) > 0, r.status_code)
+check("GET /api/history/<run_id>/annotated", r.status_code == 200 and len(r.content) > 0, r.status_code)
 
 # 流式识别（mock）
 with client.stream("POST", "/api/detect", json={"image_id": image_id, "prompt": "识别", "use_tools": True}) as resp:

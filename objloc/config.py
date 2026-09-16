@@ -13,7 +13,14 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent        # objloc/ 包目录
 PROJECT_ROOT = BASE_DIR.parent                    # 项目根目录
 RUNS_DIR = PROJECT_ROOT / "runs"                  # 运行产物放在项目根
+# ⚠️ runs/ 根目录**只放子目录与日志，不放散图**（曾经三处调用方往根目录倒进 162 张随机名 PNG）。
+# 落盘位置的分工见 AGENTS.md#4.9-上传--结果存储--历史记录：
+#   uploads/  源图（统一转 PNG，文件名 <image_id>.png）
+#   scratch/  无归属的临时标注图：CLI detect、模型自己调的 annotate_image 工具
+#   history/  唯一的持久化入口：每次打标一条记录 history/<run_id>/{meta.json,annotated.png}
 UPLOAD_DIR = RUNS_DIR / "uploads"
+SCRATCH_DIR = RUNS_DIR / "scratch"
+HISTORY_DIR = RUNS_DIR / "history"
 WEB_STATIC_DIR = BASE_DIR / "web" / "static"      # 静态页随包走
 
 # 默认系统提示词：物体定位 + 工具使用约定
@@ -117,6 +124,14 @@ class Settings:
     host: str = field(default_factory=lambda: os.getenv("WEB_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _env_int("WEB_PORT", 8765))
 
+    # ---- 上传 / 历史记录（见 AGENTS.md#4.9-上传--结果存储--历史记录）----
+    # 单张上传的大小上限（MB），0 = 不限。落盘时边写边累计字节，超限立刻中断并删掉半截文件，
+    # 否则一个几百 MB 的请求会先把磁盘写满再报错。
+    max_upload_mb: int = field(default_factory=lambda: _env_int("MAX_UPLOAD_MB", 20))
+    # 历史记录保留条数，0 = 不限。每次新增记录后按 run_id 删最老的，
+    # 这是防「只增不减」的闸门（runs/ 根目录那 162 张散图就是这么攒出来的）。
+    history_max: int = field(default_factory=lambda: _env_int("HISTORY_MAX", 200))
+
     def resolved_provider(self) -> str:
         """把 auto 解析成具体 provider。
 
@@ -141,5 +156,7 @@ def get_settings(refresh: bool = False) -> Settings:
     if _settings is None or refresh:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        HISTORY_DIR.mkdir(parents=True, exist_ok=True)
         _settings = Settings()
     return _settings

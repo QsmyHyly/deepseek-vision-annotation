@@ -14,7 +14,7 @@ import argparse
 import sys
 
 from objloc.agent import build_messages, extract_items, run_agent
-from objloc.config import RUNS_DIR, get_settings
+from objloc.config import get_settings
 from objloc.tools import build_default_registry
 from objloc.visualizer import image_to_data_url_from_source, render_annotations
 
@@ -69,7 +69,8 @@ def cmd_detect(args) -> int:
     items = extract_items(final_text)
 
     if items:
-        _img, path = render_annotations(image, items, output_dir=RUNS_DIR)
+        # 走默认目录（runs/scratch/）：CLI 的标注图没有历史记录归属，不该污染 runs/ 根目录
+        _img, path = render_annotations(image, items)
         print(f"[annotated] {path}")
     else:
         print("[warn] 未从模型输出解析到坐标")

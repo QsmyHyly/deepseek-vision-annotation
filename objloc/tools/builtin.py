@@ -14,7 +14,6 @@ from objloc.parsing import (
     extract_coordinates as _extract_coordinates,
     normalize_to_unit,
 )
-from objloc.config import RUNS_DIR
 from objloc.tools.registry import ToolRegistry
 from objloc.visualizer import load_image, render_annotations, summarize
 
@@ -104,7 +103,8 @@ def annotate_image(
     ],
 ) -> dict:
     """在图片上绘制坐标标注并保存，返回标注图路径与统计信息（坐标统一按 0.0~1.0 相对比例解读）。"""
-    _img, path = render_annotations(source, items, output_dir=RUNS_DIR)
+    # 不传 output_dir -> 落到 runs/scratch/（模型自己调的标注图没有历史记录归属）
+    _img, path = render_annotations(source, items)
     return {
         "annotated_path": str(path),
         "summary": summarize(items),
