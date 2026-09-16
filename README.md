@@ -15,7 +15,7 @@
 ## 1. 目录结构
 
 ```
-deepseek物体定位演示软件/
+deepseek-vision-annotation/
 ├── main.py                  # CLI 入口：web / detect / tools / demo
 ├── requirements.txt
 ├── .env.example

@@ -35,6 +35,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认是 GBK：不设 PYTHONIOENCODING 时，收尾那句 "✅ 全部通过" 会抛
+# UnicodeEncodeError，让**一次全绿的 run 以退出码 1 收场**。假失败比假通过更坑 ——
+# 它会让 CI 和人工都以为断言挂了（这个坑是在搬目录后未设该变量的终端里跑出来的）。
+# 把编码错误降级为替换字符：支持 UTF-8 的终端照常显示，GBK 终端退化成 "?" 而已。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
 # 必须在导入 config 之前定下来：mock 模式，且把这些环境变量的干扰清掉
 os.environ["LLM_PROVIDER"] = "mock"
 os.environ.pop("DEEPSEEK_API_KEY", None)

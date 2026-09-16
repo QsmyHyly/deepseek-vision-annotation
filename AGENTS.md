@@ -10,7 +10,11 @@
 DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出** + **工具执行框架** + **网页打标前后对比**，
 外加一套**合成图片打标准确率评测**，以及**思考模式开关**（网页勾选框 / CLI / 环境变量）。
 
-- 工作目录：`E:\QsmyHyly-Code-Study-Workspace\deepseek物体定位演示软件`
+- 工作目录：`E:\QsmyHyly-Code-Study-Workspace\DeepSeek视觉项目\deepseek-vision-annotation`
+  - 本仓库已从原先的扁平位置搬进容器目录 `DeepSeek视觉项目\`，**与它并列的 `new-project\` 是
+    待开发的新项目，其定位就是「参考本项目」**；两个项目互为兄弟目录，新项目可直接读本仓库源码。
+  - ⚠️ 改路径时注意：本文件、README.md 目录树、以及下方第 5 节的命令里都写死了这个绝对路径，
+    搬目录要一并改（改完跑 `python tests\test_docrefs.py` 确认引用没断）。
 - Python 3.11（Windows / PowerShell）
 - 入口：`python main.py web | detect | tools | demo`，评测：`python scripts/benchmark.py`
 
@@ -553,7 +557,7 @@ DELETE /api/settings[?keys=a,b] 删掉键 -> 回落到 环境变量 > 内置默�
 ## 5. 常用命令
 
 ```powershell
-cd 'E:\QsmyHyly-Code-Study-Workspace\deepseek物体定位演示软件'
+cd 'E:\QsmyHyly-Code-Study-Workspace\DeepSeek视觉项目\deepseek-vision-annotation'
 
 # 启动网页（真实模型；确保当前会话有 DEEPSEEK_API_KEY）
 python main.py web                       # → http://127.0.0.1:8765
@@ -599,7 +603,7 @@ python tests\ui\smoke_detect.py              # HTTP 层 SSE 冒烟
 
 **后台重启服务的标准姿势**（注意刷新环境变量）：
 ```powershell
-$root='E:\QsmyHyly-Code-Study-Workspace\deepseek物体定位演示软件'
+$root='E:\QsmyHyly-Code-Study-Workspace\DeepSeek视觉项目\deepseek-vision-annotation'
 Get-NetTCPConnection -LocalPort 8765 -State Listen -EA SilentlyContinue | % { Stop-Process -Id $_.OwningProcess -Force }
 $env:DEEPSEEK_API_KEY = [Environment]::GetEnvironmentVariable('DEEPSEEK_API_KEY','User')
 $env:LLM_PROVIDER='auto'; $env:PYTHONIOENCODING='utf-8'
