@@ -195,6 +195,388 @@ const narrow = await page.evaluate(() => {
 check("窄屏退化为单列布局", narrow.cols === 1, JSON.stringify(narrow));
 check("窄屏对比区仍占满宽度且有高度", narrow.cmpW > narrow.bodyW * 0.8 && narrow.cmpH > 240, JSON.stringify(narrow));
 
+// ---- 12. 缩放 / 平移 / 全屏：用户诉求是"图片显示得太小"，这一组锁住新增的查看能力 ----
+// 关键风险是"覆盖层与图片在缩放/平移后还必须严格重合"，所以每一档缩放都单独验一次。
+await page.setViewportSize({ width: 1440, height: 900 });
+await page.click("#tabModeSlider");
+await page.waitForTimeout(300);
+
+const zoomState = () => page.evaluate(() => {
+  const im = document.getElementById("stackBefore");
+  const b = im.getBoundingClientRect();
+  const o = document.getElementById("stackOverlay").getBoundingClientRect();
+  const s = document.getElementById("cmpStage").getBoundingClientRect();
+  return {
+    b: { x: b.x, y: b.y, w: b.width, h: b.height },
+    o: { x: o.x, y: o.y, w: o.width, h: o.height },
+    stage: { x: s.x, y: s.y, w: s.width, h: s.height },
+    label: document.getElementById("zoomLabel").textContent,
+    transform: document.getElementById("zoomLayer").style.transform,
+    natural: [im.naturalWidth, im.naturalHeight],
+  };
+});
+// 覆盖层与图片的屏幕 rect 是否严格重合（同一条 1.2px 口径，见上面的 near()）
+const coincide = (s) => near(s.b.x, s.o.x) && near(s.b.y, s.o.y) && near(s.b.w, s.o.w) && near(s.b.h, s.o.h);
+const deviate = (s) => "Δ=(" + Math.abs(s.o.x - s.b.x).toFixed(2) + "," + Math.abs(s.o.y - s.b.y).toFixed(2) + "," +
+  Math.abs(s.o.w - s.b.w).toFixed(2) + "," + Math.abs(s.o.h - s.b.h).toFixed(2) + ")";
+
+const fitGeom = await zoomState();
+check("有图时缩放工具条出现（初始为适应窗口）", await page.isVisible("#zoomBar"), "比例标签=" + fitGeom.label + " transform=" + JSON.stringify(fitGeom.transform));
+
+// 滚轮缩放：以指针为锚点（指针下的图像点必须不动）
+const anchor = { x: fitGeom.b.x + fitGeom.b.w * 0.28, y: fitGeom.b.y + fitGeom.b.h * 0.30 };
+const fracBefore = (anchor.x - fitGeom.b.x) / fitGeom.b.w;
+await page.mouse.move(anchor.x, anchor.y);
+await page.mouse.wheel(0, -240);
+await page.waitForTimeout(220);
+const zoom1 = await zoomState();
+check("滚轮缩放：图片显示尺寸变大、百分比标签同步更新",
+  zoom1.b.w > fitGeom.b.w + 1 && zoom1.b.h > fitGeom.b.h + 1 && zoom1.label !== fitGeom.label,
+  fitGeom.b.w.toFixed(0) + "×" + fitGeom.b.h.toFixed(0) + " " + fitGeom.label + " -> " + zoom1.b.w.toFixed(0) + "×" + zoom1.b.h.toFixed(0) + " " + zoom1.label);
+const fracAfter = (anchor.x - zoom1.b.x) / zoom1.b.w;
+check("缩放以鼠标指针为锚点（指针下的图像点保持不动）", Math.abs(fracAfter - fracBefore) < 0.02,
+  "锚点处图像横向相对位置 " + fracBefore.toFixed(4) + " -> " + fracAfter.toFixed(4));
+check("缩放后覆盖层仍与图片严格重合（±1.2px）", coincide(zoom1),
+  "img=" + zoom1.b.w.toFixed(1) + "×" + zoom1.b.h.toFixed(1) + " @" + zoom1.b.x.toFixed(1) + "," + zoom1.b.y.toFixed(1) + " " + deviate(zoom1));
+
+// 再放大两档，逐档验证重合
+const zoomLevels = [];
+for (let i = 0; i < 2; i++) {
+  await page.mouse.wheel(0, -260);
+  await page.waitForTimeout(200);
+  zoomLevels.push(await zoomState());
+}
+zoomLevels.forEach((s, i) => {
+  check("第 " + (i + 2) + " 档缩放（" + s.label + "）覆盖层仍与图片重合", coincide(s),
+    "img=" + s.b.w.toFixed(1) + "×" + s.b.h.toFixed(1) + " " + deviate(s));
+});
+
+// 拖动平移
+const beforePan = await zoomState();
+await page.mouse.move(anchor.x, anchor.y);
+await page.mouse.down();
+await page.mouse.move(anchor.x + 70, anchor.y + 45, { steps: 8 });
+await page.mouse.up();
+await page.waitForTimeout(250);
+const afterPan = await zoomState();
+check("按住左键拖动可平移图片", near(afterPan.b.x - beforePan.b.x, 70, 2) && near(afterPan.b.y - beforePan.b.y, 45, 2),
+  "位移=(" + (afterPan.b.x - beforePan.b.x).toFixed(1) + "," + (afterPan.b.y - beforePan.b.y).toFixed(1) + ") 期望=(70,45)");
+check("平移后图片与覆盖层同步位移（两者 rect 之差不变）",
+  near(afterPan.o.x - afterPan.b.x, beforePan.o.x - beforePan.b.x) &&
+  near(afterPan.o.y - afterPan.b.y, beforePan.o.y - beforePan.b.y) &&
+  near(afterPan.o.w - afterPan.b.w, beforePan.o.w - beforePan.b.w) && coincide(afterPan),
+  "位移前 o-b=" + (beforePan.o.x - beforePan.b.x).toFixed(2) + " 位移后 o-b=" + (afterPan.o.x - afterPan.b.x).toFixed(2) + " " + deviate(afterPan));
+
+// 适应窗口 / 1:1 / 双击复位
+await page.click("#btnZoomFit");
+await page.waitForTimeout(220);
+const fitBack = await zoomState();
+check("「适应窗口」按钮复位缩放与平移", fitBack.transform === "" && near(fitBack.b.w, fitGeom.b.w, 0.6) && fitBack.label === fitGeom.label,
+  "label=" + fitBack.label + " transform=" + JSON.stringify(fitBack.transform) + " w=" + fitBack.b.w.toFixed(1));
+
+await page.click("#btnZoom1x");
+await page.waitForTimeout(220);
+const oneToOne = await zoomState();
+check("「1:1」按钮按原始像素显示（标签 100%）",
+  oneToOne.label === "100%" && near(oneToOne.b.w, oneToOne.natural[0], 1.5) && near(oneToOne.b.h, oneToOne.natural[1], 1.5),
+  "label=" + oneToOne.label + " 显示=" + oneToOne.b.w.toFixed(1) + "×" + oneToOne.b.h.toFixed(1) + " 原始=" + oneToOne.natural.join("×"));
+check("1:1 时覆盖层仍与图片重合", coincide(oneToOne), deviate(oneToOne));
+
+await page.mouse.dblclick(anchor.x, anchor.y);
+await page.waitForTimeout(250);
+const dblFit = await zoomState();
+check("双击从 1:1 切回适应窗口", near(dblFit.b.w, fitGeom.b.w, 0.6) && dblFit.label === fitGeom.label,
+  "label=" + dblFit.label + " w=" + dblFit.b.w.toFixed(1) + "（适应=" + fitGeom.b.w.toFixed(1) + "）");
+await page.mouse.dblclick(anchor.x, anchor.y);
+await page.waitForTimeout(250);
+check("再双击切到 1:1", (await zoomState()).label === "100%", "label=" + (await zoomState()).label);
+await page.click("#btnZoomFit");
+await page.waitForTimeout(200);
+
+// ⚠️「适应」与「1:1」是"救援按钮"：任何缩放/平移历史下都必须能把画面恢复成可用状态。
+// 先把图拖到视口外（每个方向拖三次），再分别点这两个按钮，看画面能不能回来。
+const inViewArea = (s) => {
+  const w = Math.max(0, Math.min(s.b.x + s.b.w, s.stage.x + s.stage.w) - Math.max(s.b.x, s.stage.x));
+  const h = Math.max(0, Math.min(s.b.y + s.b.h, s.stage.y + s.stage.h) - Math.max(s.b.y, s.stage.y));
+  return w * h;
+};
+const dragAway = async () => {
+  for (let i = 0; i < 3; i++) {
+    await page.mouse.move(anchor.x, anchor.y);
+    await page.mouse.down();
+    await page.mouse.move(anchor.x + 1500, anchor.y + 1000, { steps: 4 });
+    await page.mouse.up();
+    await page.waitForTimeout(120);
+  }
+};
+await page.mouse.move(anchor.x, anchor.y);
+await page.mouse.wheel(0, -300);
+await page.waitForTimeout(200);
+await dragAway();
+const draggedAway = await zoomState();
+await page.click("#btnZoomFit");
+await page.waitForTimeout(250);
+const refitted = await zoomState();
+check("拖到视口外后「适应」仍能把整图恢复回来",
+  inViewArea(refitted) > refitted.b.w * refitted.b.h * 0.98 && coincide(refitted),
+  "拖走后可见=" + Math.round(inViewArea(draggedAway)) + "px² → 适应后 " + Math.round(inViewArea(refitted)) +
+  "px²（整图 " + Math.round(refitted.b.w * refitted.b.h) + "px²）");
+await page.mouse.move(anchor.x, anchor.y);
+await page.mouse.wheel(0, -300);
+await page.waitForTimeout(200);
+await dragAway();
+await page.click("#btnZoom1x");
+await page.waitForTimeout(250);
+const oneToOneAfter = await zoomState();
+check("拖到视口外后「1:1」会把画面摆回视口正中",
+  oneToOneAfter.label === "100%" &&
+  near(oneToOneAfter.b.x + oneToOneAfter.b.w / 2, oneToOneAfter.stage.x + oneToOneAfter.stage.w / 2, 1.5) &&
+  near(oneToOneAfter.b.y + oneToOneAfter.b.h / 2, oneToOneAfter.stage.y + oneToOneAfter.stage.h / 2, 1.5) &&
+  coincide(oneToOneAfter),
+  "label=" + oneToOneAfter.label + " 中心偏移=(" +
+  (oneToOneAfter.b.x + oneToOneAfter.b.w / 2 - oneToOneAfter.stage.x - oneToOneAfter.stage.w / 2).toFixed(1) + "," +
+  (oneToOneAfter.b.y + oneToOneAfter.b.h / 2 - oneToOneAfter.stage.y - oneToOneAfter.stage.h / 2).toFixed(1) + ") " + deviate(oneToOneAfter));
+await page.click("#btnZoomFit");
+await page.waitForTimeout(200);
+
+// 手柄与平移必须分工：拖手柄只改分割位置，不能把图片一起拖走
+const handleDrag = await page.evaluate(() => {
+  const r = document.getElementById("sliderHandle").getBoundingClientRect();
+  return { x: r.x + r.width / 2, y: r.y + r.height / 2, now: Number(document.getElementById("sliderHandle").getAttribute("aria-valuenow")) };
+});
+const beforeHandleDrag = await zoomState();
+await page.mouse.move(handleDrag.x, handleDrag.y);
+await page.mouse.down();
+await page.mouse.move(handleDrag.x - 60, handleDrag.y, { steps: 5 });
+await page.mouse.up();
+await page.waitForTimeout(200);
+const afterHandleDrag = await zoomState();
+const handleNow = Number(await page.getAttribute("#sliderHandle", "aria-valuenow"));
+check("拖分隔线手柄只改分割位置、不会平移图片",
+  near(afterHandleDrag.b.x, beforeHandleDrag.b.x) && near(afterHandleDrag.b.y, beforeHandleDrag.b.y) &&
+  Math.abs(handleNow - handleDrag.now) > 3,
+  "图片位移=" + (afterHandleDrag.b.x - beforeHandleDrag.b.x).toFixed(1) + "px 分割 " + handleDrag.now + "% -> " + handleNow + "%");
+
+// 按钮无障碍：Tab 可达 + aria-label
+const zoomA11y = await page.evaluate(() => ["btnZoomOut", "btnZoomIn", "btnZoomFit", "btnZoom1x", "btnZoomFull"].map((id) => {
+  const el = document.getElementById(id);
+  return { id: id, label: el && el.getAttribute("aria-label"), focusable: !!el && el.tabIndex >= 0 };
+}));
+check("缩放按钮都有 aria-label 且可 Tab 聚焦", zoomA11y.every((x) => x.label && x.focusable), JSON.stringify(zoomA11y));
+
+// 缩放范围钳制在 10%~800%
+await page.mouse.move(anchor.x, anchor.y);
+for (let i = 0; i < 20; i++) await page.mouse.wheel(0, -400);
+await page.waitForTimeout(250);
+const zoomMax = await zoomState();
+for (let i = 0; i < 45; i++) await page.mouse.wheel(0, 400);
+await page.waitForTimeout(250);
+const zoomMin = await zoomState();
+check("缩放范围被钳制在 10%~800%（两端仍精确重合）",
+  Number(zoomMax.label.replace("%", "")) <= 800 && Number(zoomMin.label.replace("%", "")) >= 10 && coincide(zoomMax) && coincide(zoomMin),
+  "上限=" + zoomMax.label + " " + deviate(zoomMax) + " 下限=" + zoomMin.label + " " + deviate(zoomMin));
+
+// 并排模式：缩放作用于**每一格自己的视口**（.pane-zoom），两格同倍率同位置对照
+await page.click("#btnZoomFit");
+await page.click("#tabModeSide");
+await page.waitForTimeout(300);
+const paneRect = () => page.evaluate(() => {
+  const a = document.getElementById("sideBefore").getBoundingClientRect();
+  const b = document.getElementById("sideAfter").getBoundingClientRect();
+  return { a: [a.width, a.height], b: [b.width, b.height] };
+});
+const sideBeforeZoom = await paneRect();
+const stageCenter = await page.evaluate(() => {
+  const r = document.getElementById("cmpStage").getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+});
+await page.mouse.move(stageCenter.x, stageCenter.y);
+await page.mouse.wheel(0, -300);
+await page.waitForTimeout(250);
+const sideAfterZoom = await paneRect();
+const kLeft = sideAfterZoom.a[0] / sideBeforeZoom.a[0], kRight = sideAfterZoom.b[0] / sideBeforeZoom.b[0];
+check("并排模式下两格同步同倍率放大", kLeft > 1.05 && Math.abs(kLeft - kRight) < 0.02,
+  "左格×" + kLeft.toFixed(3) + " 右格×" + kRight.toFixed(3));
+
+// ⚠️ 上面那条只比了"倍率比值"，量不出"两格看到的是不是同一块图"——pane 与 img 的 rect 本来就同比，
+// 那是恒真断言（曾经因此漏掉一个真 bug：两格被一起推出对比区，一格露左半、一格露右半）。
+// 这里改成量**看得见的窗口**换算成原图归一化坐标后的区间。注意 getBoundingClientRect() 不受
+// overflow 裁剪影响，所以必须三重相交：图片 ∩ 窗格(.pane 的 overflow:hidden) ∩ 对比区(#cmpStage)。
+const sideWindow = () => page.evaluate(() => {
+  const sr = document.getElementById("cmpStage").getBoundingClientRect();
+  return [...document.querySelectorAll("#modeSide .pane")].map((pane) => {
+    const img = pane.querySelector("img");
+    const pr = pane.getBoundingClientRect(), ir = img.getBoundingClientRect();
+    const l = Math.max(pr.left, sr.left), r = Math.min(pr.right, sr.right);
+    const t = Math.max(pr.top, sr.top), b = Math.min(pr.bottom, sr.bottom);
+    const vl = Math.max(ir.left, l), vr = Math.min(ir.right, r);
+    const vt = Math.max(ir.top, t), vb = Math.min(ir.bottom, b);
+    return {
+      paneW: pr.width, winW: Math.max(0, r - l), visW: Math.max(0, vr - vl),
+      nx: [(vl - ir.left) / ir.width, (vr - ir.left) / ir.width],
+      ny: [(vt - ir.top) / ir.height, (vb - ir.top) / ir.height],
+    };
+  });
+});
+// 再放大两档（共 3 档，与复现脚本 runs/probe_side_zoom.mjs 的条件一致）
+for (let i = 0; i < 2; i++) { await page.mouse.wheel(0, -120); await page.waitForTimeout(200); }
+const sw = await sideWindow();
+const [s0, s1] = sw;
+const fmtRange = (s) => "x=[" + s.nx[0].toFixed(4) + "," + s.nx[1].toFixed(4) + "] y=[" + s.ny[0].toFixed(4) + "," + s.ny[1].toFixed(4) + "]";
+check("并排两格看到的是同一块归一化区域（逐项 < 0.01）",
+  Math.abs(s0.nx[0] - s1.nx[0]) < 0.01 && Math.abs(s0.nx[1] - s1.nx[1]) < 0.01 &&
+  Math.abs(s0.ny[0] - s1.ny[0]) < 0.01 && Math.abs(s0.ny[1] - s1.ny[1]) < 0.01,
+  "左格 " + fmtRange(s0) + " 右格 " + fmtRange(s1));
+// 平移同样必须是两格共享的一个量：在**右格**里拖，两格仍要看到同一块归一化区域
+await page.mouse.move(stageCenter.x + 150, stageCenter.y);
+await page.mouse.down();
+await page.mouse.move(stageCenter.x + 90, stageCenter.y - 40, { steps: 3 });
+await page.mouse.up();
+await page.waitForTimeout(200);
+const swPanned = await sideWindow();
+check("并排在右格内拖动平移后，两格仍看到同一块归一化区域",
+  Math.abs(swPanned[0].nx[0] - swPanned[1].nx[0]) < 0.01 && Math.abs(swPanned[0].nx[1] - swPanned[1].nx[1]) < 0.01 &&
+  Math.abs(swPanned[0].ny[0] - swPanned[1].ny[0]) < 0.01 && Math.abs(swPanned[0].ny[1] - swPanned[1].ny[1]) < 0.01,
+  "左格 " + fmtRange(swPanned[0]) + " 右格 " + fmtRange(swPanned[1]));
+check("并排两格都没被推出对比区、且可见窗口宽度相等",
+  near(s0.winW, s0.paneW, 0.6) && near(s1.winW, s1.paneW, 0.6) &&
+  near(s0.visW, s1.visW, 0.6) && s0.visW > 0,
+  "左格窗格内 " + s0.winW.toFixed(1) + "/" + s0.paneW.toFixed(1) + " 可见 " + s0.visW.toFixed(1) +
+  "；右格窗格内 " + s1.winW.toFixed(1) + "/" + s1.paneW.toFixed(1) + " 可见 " + s1.visW.toFixed(1));
+await page.screenshot({ path: "runs/ui/zoomed.png" });
+await page.click("#tabModeSlider");
+await page.click("#btnZoomFit");
+await page.waitForTimeout(250);
+
+// 左栏折叠：把宽度让给对比区（与右栏控制台折叠同一诉求）
+const stageWide = (await zoomState()).stage.w;
+await page.click("#btnToggleLeft");
+await page.waitForTimeout(350);
+const leftCollapsed = await page.evaluate(() => {
+  const s = document.getElementById("cmpStage").getBoundingClientRect();
+  const b = document.getElementById("stackBefore").getBoundingClientRect();
+  const o = document.getElementById("stackOverlay").getBoundingClientRect();
+  return {
+    cls: document.getElementById("layout").classList.contains("left-collapsed"),
+    stackHidden: !document.getElementById("leftStack").offsetParent,
+    stage: s.width,
+    dx: Math.abs(o.x - b.x), dy: Math.abs(o.y - b.y), dw: Math.abs(o.width - b.width), dh: Math.abs(o.height - b.height),
+  };
+});
+check("折叠左栏后对比区变宽", leftCollapsed.cls && leftCollapsed.stackHidden && leftCollapsed.stage > stageWide + 20,
+  stageWide.toFixed(0) + " -> " + leftCollapsed.stage.toFixed(0));
+check("折叠左栏后覆盖层仍与图片重合",
+  leftCollapsed.dx <= 1.2 && leftCollapsed.dy <= 1.2 && leftCollapsed.dw <= 1.2 && leftCollapsed.dh <= 1.2,
+  "Δ=(" + leftCollapsed.dx.toFixed(2) + "," + leftCollapsed.dy.toFixed(2) + "," + leftCollapsed.dw.toFixed(2) + "," + leftCollapsed.dh.toFixed(2) + ")");
+
+// 折叠状态下再缩放一次：宽度变了，覆盖层必须仍然贴住
+const collapsedBase = await zoomState();
+await page.mouse.move(collapsedBase.b.x + collapsedBase.b.w * 0.4, collapsedBase.b.y + collapsedBase.b.h * 0.4);
+await page.mouse.wheel(0, -260);
+await page.waitForTimeout(300);
+const collapsedZoom = await zoomState();
+check("左栏折叠状态下缩放，覆盖层仍与图片重合", coincide(collapsedZoom),
+  "img=" + collapsedZoom.b.w.toFixed(1) + "×" + collapsedZoom.b.h.toFixed(1) + " " + deviate(collapsedZoom));
+
+// 窄屏：单列里不存在"左右让宽度"，必须无视折叠状态（否则用户会以为左栏丢了）
+await page.setViewportSize({ width: 900, height: 820 });
+await page.waitForTimeout(350);
+const narrowLeft = await page.evaluate(() => ({
+  cols: getComputedStyle(document.getElementById("layout")).gridTemplateColumns.split(" ").length,
+  stackVisible: !!document.getElementById("leftStack").offsetParent,
+  toggle: getComputedStyle(document.getElementById("btnToggleLeft")).display,
+  w: document.getElementById("cmpStage").getBoundingClientRect().width,
+  bodyW: document.body.clientWidth,
+}));
+check("窄屏 900px 仍是单列，且折叠状态被忽略（左栏始终展开）",
+  narrowLeft.cols === 1 && narrowLeft.stackVisible && narrowLeft.toggle === "none" && narrowLeft.w > narrowLeft.bodyW * 0.8,
+  JSON.stringify(narrowLeft));
+await page.setViewportSize({ width: 1440, height: 900 });
+await page.waitForTimeout(300);
+await page.click("#btnToggleLeft");
+await page.waitForTimeout(300);
+check("展开左栏后对比区宽度回到原值", near((await zoomState()).stage.w, stageWide, 1.5),
+  (await zoomState()).stage.w.toFixed(0) + " vs " + stageWide.toFixed(0));
+
+// 全屏：无头浏览器如果拿不到全屏权限，也只断言"按钮可用 + 点击不报错"，不假装验证通过
+const fullBtn = await page.evaluate(() => {
+  const el = document.getElementById("btnZoomFull");
+  return { exists: !!el, label: el && el.getAttribute("aria-label"), text: el && el.textContent.trim() };
+});
+const errBeforeFull = consoleErrors.length;
+await page.mouse.move(anchor.x, anchor.y);
+await page.mouse.wheel(0, -300);            // 顺带验证"进出全屏要保持缩放状态"
+await page.waitForTimeout(200);
+const beforeFull = await zoomState();
+await page.click("#btnZoomFull");
+await page.waitForTimeout(500);
+const fullInfo = await page.evaluate(() => {
+  const s = document.getElementById("cmpStage").getBoundingClientRect();
+  const b = document.getElementById("stackBefore").getBoundingClientRect();
+  const o = document.getElementById("stackOverlay").getBoundingClientRect();
+  return {
+    active: !!document.fullscreenElement,
+    stage: [s.width, s.height], vw: window.innerWidth, vh: window.innerHeight,
+    dx: Math.abs(o.x - b.x), dy: Math.abs(o.y - b.y), dw: Math.abs(o.width - b.width), dh: Math.abs(o.height - b.height),
+    label: document.getElementById("zoomLabel").textContent,
+    transform: document.getElementById("zoomLayer").style.transform,
+  };
+});
+check("全屏按钮存在、有 aria-label、点击不报错",
+  fullBtn.exists && !!fullBtn.label && consoleErrors.length === errBeforeFull,
+  "按钮=「" + fullBtn.text + "」aria-label=" + fullBtn.label + " 新增错误=" + (consoleErrors.length - errBeforeFull) +
+  " fullscreenElement=" + fullInfo.active);
+// 只有浏览器真的进了全屏才断言"铺满 + 重合 + 保持缩放"，否则如实跳过
+if (fullInfo.active) {
+  check("全屏下对比区真正铺满屏幕", near(fullInfo.stage[0], fullInfo.vw, 2) && near(fullInfo.stage[1], fullInfo.vh, 2),
+    fullInfo.stage.map((v) => v.toFixed(0)).join("×") + " vs 视口 " + fullInfo.vw + "×" + fullInfo.vh);
+  // 全屏后容器变大：显示比例（标签）与平移必须原样保留，而变换层的 k 会被重算以满足这个比例
+  const samePan = (a, b) => a.replace(/scale\([^)]*\)/, "") === b.replace(/scale\([^)]*\)/, "");
+  check("全屏下覆盖层仍与图片重合、且显示比例与平移原样保留",
+    fullInfo.label === beforeFull.label && samePan(beforeFull.transform, fullInfo.transform) &&
+    fullInfo.dx <= 1.2 && fullInfo.dy <= 1.2 && fullInfo.dw <= 1.2 && fullInfo.dh <= 1.2,
+    "比例 " + beforeFull.label + " -> " + fullInfo.label + "；transform " + JSON.stringify(beforeFull.transform) +
+    " -> " + JSON.stringify(fullInfo.transform) +
+    " Δ=(" + fullInfo.dx.toFixed(2) + "," + fullInfo.dy.toFixed(2) + "," + fullInfo.dw.toFixed(2) + "," + fullInfo.dh.toFixed(2) + ")");
+}
+await page.screenshot({ path: "runs/ui/fullscreen.png" });
+// 退出全屏：Esc 由浏览器处理（无头 shell 可能不响应），这里用"再点一次按钮"这条应用自身的路径
+if (fullInfo.active) {
+  await page.click("#btnZoomFull");
+  await page.waitForTimeout(400);
+}
+if (await page.evaluate(() => !!document.fullscreenElement)) {
+  await page.evaluate(() => { const exit = document.exitFullscreen || document.webkitExitFullscreen; if (exit) exit.call(document); });
+  await page.waitForTimeout(400);
+}
+check("再点一次全屏按钮能退出全屏", !(await page.evaluate(() => !!document.fullscreenElement)));
+await page.click("#btnZoomFit");
+await page.waitForTimeout(200);
+
+// 叠加模式是整图重合叠放：不能沿用滑块留下的裁剪（否则标注图会缺一块）
+await page.click("#tabModeSlider");
+await page.waitForTimeout(200);
+const splitGeom = await zoomState();
+const handleNow2 = await page.evaluate(() => {
+  const r = document.getElementById("sliderHandle").getBoundingClientRect();
+  return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+});
+await page.mouse.move(handleNow2.x, handleNow2.y);
+await page.mouse.down();
+await page.mouse.move(splitGeom.b.x + splitGeom.b.w * 0.25, splitGeom.b.y + splitGeom.b.h * 0.5, { steps: 5 });
+await page.mouse.up();
+await page.waitForTimeout(200);
+const clipInSlider = await page.evaluate(() => document.getElementById("stackAfter").style.clipPath);
+await page.click("#tabModeOverlay");
+await page.waitForTimeout(250);
+const clipInOverlay = await page.evaluate(() => document.getElementById("stackAfter").style.clipPath);
+check("切到叠加模式会清掉滑块留下的裁剪", clipInOverlay === "none", "滑块时=" + clipInSlider + " 叠加时=" + clipInOverlay);
+await page.click("#tabModeSlider");
+await page.waitForTimeout(250);
+const clipRestored = await page.evaluate(() => document.getElementById("stackAfter").style.clipPath);
+check("切回滑块模式恢复原来的分割位置（25%）", Math.abs(Number((clipRestored.match(/inset\([^)]*?([\d.]+)%\)/) || [])[1]) - 25) <= 1.5, clipRestored);
+await page.click("#btnZoomFit");
+await page.waitForTimeout(200);
 // 截图存档（宽屏 + 窄屏各一张，窄屏截图前先切回叠加模式看效果）
 await page.setViewportSize({ width: 1440, height: 900 });
 await page.click("#tabModeSlider");
@@ -217,5 +599,5 @@ check("无 JS 运行时错误（console/pageerror）", unexpected.length === 0, 
 await browser.close();
 const failed = results.filter((r) => !r.ok);
 console.log("\n" + (results.length - failed.length) + "/" + results.length + " 项通过");
-console.log("截图: runs/ui/wide-slider.png, runs/ui/wide-collapsed.png, runs/ui/narrow.png");
+console.log("截图: runs/ui/wide-slider.png, runs/ui/wide-collapsed.png, runs/ui/narrow.png, runs/ui/zoomed.png, runs/ui/fullscreen.png");
 process.exit(failed.length ? 1 : 0);

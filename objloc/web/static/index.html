@@ -46,7 +46,7 @@ DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTM
     state.run    本轮识别的运行态（token / active / controller / 轮次 / 是否已出标注图）
     state.result 结果（annotatedUrl / items / summary / accuracy）
     state.stream 流式计数与"最新一行"
-    state.view   纯 UI 偏好（对比模式 / 分隔线位置 / 不透明度 / 思考开关 / 控制台折叠）
+    state.view   纯 UI 偏好（对比模式 / 分隔线位置 / 不透明度 / 缩放平移 / 思考开关 / 左右栏折叠）
     state.alerts 顶部告警条的内容栈
 
 改动状态后调用对应的 renderXxx()，不在事件回调里零散地碰 DOM。
@@ -83,6 +83,64 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
 4. 无障碍：Tab 用 role=tab/tablist 且只有一个 tab 可聚焦；分隔线是 role=slider 可聚焦、
    可用左右方向键调整；关键区域有 aria-label；状态与告警分别用 role=status / aria-live。
 5. 零依赖：不引 npm / CDN / 字体 / 图标库，全部内联。
+
+--------------------------------------------------------------------------------
+五、缩放 / 平移 / 全屏：为什么 syncFrame 必须"变换无关"
+--------------------------------------------------------------------------------
+用户的核心诉求是"显示图片的部分太小了"。所以对比区支持：滚轮缩放（以鼠标指针为锚点）、
+按住左键拖动平移、双击在「适应窗口」与「1:1」之间切换、以及整个对比区全屏。
+承载变换的元素按模式分两类，两者都是"零 padding / border + transform-origin: 0 0"：
+  · 滑块 / 叠加：一个公共的变换层 #zoomLayer（position:absolute; inset:0; 内部 flex 居中），
+    两张图重合在同一视口里，缩放/平移只作用于这一层；
+  · 并排：#zoomLayer 保持单位变换，改由**每格自己的 .pane-zoom** 承载 ——
+    即"**每一格是一个独立视口**"。两格等大，同一个 (k, tx, ty) 施加到两格上，两格看到的
+    归一化区域就完全一致，这才叫同倍率同位置对照，两格也各自完整地留在对比区内。
+    ⚠️ 曾经只缩放那个公共层：两格被当成一整块推出去，一格露左半、一格露右半，
+    同一张图被劈成互不重叠的两块（复现脚本 runs/probe_side_zoom.mjs，已由 ui_check 锁住）。
+占位符 #stageEmpty 与缩放工具条 #zoomBar 留在变换元素之外——前者不该被缩放，
+后者不该跟着图片跑，也不该占用图片的垂直空间。
+变换写成 translate(tx,ty) scale(k)，即局部点 p 映射到屏幕：视口原点 + t + k·p。
+
+⚠️ 关键约束：标注层 #stackOverlay 与作为几何基准的原图 #stackBefore 同在变换元素内，
+所以 overlay 的 left/top/width/height 是**未变换的局部坐标**（相对该元素的 padding box）。
+syncFrame 绝不能拿两者的屏幕 rect 直接相减，必须先除以该元素当前生效的 k（layerK()）：
+
+    overlay.left = (beforeRect.left − layerRect.left) / k    // top / width / height 同理
+
+前提三条，缺一条就错位，改这块时必须同时满足：
+  ① 变换元素没有 padding / border（否则 padding box 原点不等于它的 rect 原点）；
+  ② transform-origin 是 0 0（否则 scale 的缩放中心不是元素原点，除法算式不再成立）；
+  ③ 除掉的 k 就是当前真正写在 transform 上的那个系数（并排时 #zoomLayer 是单位变换，
+     要除的是每格自己那层上的 k；故用 layerK() 取，别直接拿 state.view.zoom）。
+好处是：不论 k、t 取何值，两层元素的屏幕 rect 恒等，滚轮缩放 / 拖动平移 / 折叠左右栏 /
+进出全屏都不需要任何额外补偿。
+
+百分比仍然天然是"图片的百分比"：分隔线在 overlay 内部按 left: pct% 定位，overlay 的宽度
+恒等于图片显示宽度（局部），clip-path 的百分比只认 overlay 自己的盒子，缩放不改变语义。
+但变换元素里的"控件类"元素（分隔线、手柄、角标）会跟着一起放大，故用 CSS 变量 --zk = 1/k
+把它们反向缩回去（见 .slider-handle / .stack-tag / .pane-tag），保证屏幕尺寸恒定。
+--zk 挂在**被变换的那个元素**上（setTransform() 里设），而不是挂在 #cmpStage 上：
+并排时 .pane-tag 在 .pane 里、不在 .pane-zoom 内，本就不该被反向缩回，
+它继承到的正是 #zoomLayer 上的 --zk = 1。
+
+标签上的百分比是**真实像素比例**（图片当前显示宽度 ÷ 原图像素宽度），所以「1:1」恰好读作
+100%，而「适应窗口」会读成比如 62%。为此 state.view 里存三个量：
+  zoom   变换系数 k —— 真正写在 transform 上的那个数（并排时同时写到两格各自的层上）；
+  ratio  显示比例 —— custom 模式下用户"要"的比例（用户意图，尺寸变化时保持不变）；
+  zoomMode  fit（跟随容器排版）/ custom（用户调过）。
+custom 模式下由 ratio 反推 k = ratio / fitRatio，于是折叠左右栏、进出全屏这类**容器尺寸变化
+不会改变显示比例**——「1:1」必须始终真的是 1 个图像像素 = 1 个 CSS 像素，而定死的 k 做不到这点。
+measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 已经含了变换、要除回去才是布局宽度。
+以指针为锚点的推导见 zoomTo()（L 取**鼠标所在那一格**的未变换原点，并排时两格各有一个 L）：
+
+    p = (c − L − t) / k     缩放后要求 L + t' + k'·p = c    ⇒    t' = (c − L) − k'·p
+
+另外两条"别把图弄丢"的兜底：clampPan() 保证图片任意拖动后至少留 MIN_VISIBLE 像素可见；
+「1:1」不只是改倍率，还会把图片摆回视口正中（setZoomOneToOne），
+于是「适应」与「1:1」在任何缩放历史下都能把画面恢复成可用状态。
+
+平移与分隔线手柄不能打架：手柄上按下时只拖分隔线（pointerdown 直接返回，不启动平移），
+其余区域一律平移——否则"拖动图片"会顺手把分隔线带跑。
 -->
 <style>
   :root {
@@ -105,6 +163,7 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     --radius: 12px;
     --radius-sm: 8px;
     --col-left: 344px;
+    --col-left-rail: 46px;   /* 左栏折叠成竖条后的宽度，与 --rail 同一套思路 */
     --col-right: 404px;
     --rail: 56px;
     --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
@@ -191,9 +250,25 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     transition: grid-template-columns .18s ease;
   }
   .layout.console-collapsed { grid-template-columns: var(--col-left) minmax(0, 1fr) var(--rail); }
+  /* 左栏折叠：整栏缩成竖条，把宽度让给中栏对比区。
+     下面两条与上面那条权重相同或更高，必须按 普通 → 单折叠 → 双折叠 的顺序排列，否则会互相覆盖。 */
+  .layout.left-collapsed { grid-template-columns: var(--col-left-rail) minmax(0, 1fr) var(--col-right); }
+  .layout.left-collapsed.console-collapsed { grid-template-columns: var(--col-left-rail) minmax(0, 1fr) var(--rail); }
   .col { min-height: 0; display: flex; flex-direction: column; gap: 12px; overflow: auto; }
   .col-center { overflow: hidden; }
   .col-right { overflow: hidden; }
+  /* 左栏折叠开关：始终在栏内最上方，折叠后自己缩成竖排文字（否则用户没法再展开） */
+  .left-stack { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .left-toggle {
+    align-self: stretch; cursor: pointer; font-family: inherit; font-size: 12px; text-align: left;
+    background: var(--panel-2); color: var(--muted); border: 1px solid var(--line);
+    border-radius: var(--radius-sm); padding: 5px 10px;
+  }
+  .left-toggle:hover { border-color: var(--accent); color: var(--text); }
+  .layout.left-collapsed .left-stack { display: none; }
+  .layout.left-collapsed .left-toggle {
+    align-self: center; writing-mode: vertical-rl; letter-spacing: 3px; padding: 10px 5px; text-align: center;
+  }
 
   .card {
     background: var(--panel); border: 1px solid var(--line);
@@ -309,7 +384,43 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
       var(--bg-soft);
     box-shadow: inset 0 0 0 1px var(--line);
     border-radius: var(--radius-sm);
+    /* --zk = 1/缩放系数：覆盖层内的分隔线 / 手柄 / 角标靠它反向缩放，保证屏幕上尺寸恒定 */
+    --zk: 1;
+    user-select: none;
   }
+  /* 可拖动 = 有图；grab/grabbing 只加在对比区本体上，控件类元素各自覆盖回自己的光标 */
+  .cmp.can-pan { cursor: grab; }
+  .cmp.can-pan.panning { cursor: grabbing; }
+  .cmp.can-pan .slider-handle { cursor: ew-resize; }
+  .cmp.can-pan .zoom-bar { cursor: default; }
+  .cmp img { -webkit-user-drag: none; }
+
+  /* 变换层：滑块 / 叠加的 stack 在它里面，缩放/平移只改这一层的 transform。
+     ⚠️ 并排模式**不用**这一层（那样两格会被当成一整块推出去、各剩半格），
+     而是每格各有一个 .pane-zoom，见上面的规则与文件头「五」。
+     绝不能给它加 padding / border，也不能改 transform-origin —— syncFrame 的
+     "屏幕 rect 差 ÷ k = 局部坐标" 依赖这两个前提。 */
+  .zoom-layer {
+    position: absolute; inset: 0; transform-origin: 0 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  /* 缩放工具条：在变换层之外，浮动在底部居中；绝对定位，不占图片的垂直空间 */
+  .zoom-bar {
+    position: absolute; left: 50%; bottom: 8px; transform: translateX(-50%); z-index: 8;
+    display: flex; align-items: center; gap: 4px; padding: 4px 6px;
+    background: rgba(10, 15, 25, .84); border: 1px solid var(--line); border-radius: 999px;
+    backdrop-filter: blur(6px);
+  }
+  .zoom-label {
+    min-width: 50px; text-align: center; font-size: 12px; color: var(--text-dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .zoom-bar .btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent-2); }
+  /* 全屏：铺满屏幕、去圆角与内描边；::backdrop 给一层纯色底 */
+  .cmp:fullscreen { border-radius: 0; box-shadow: none; width: 100vw; height: 100vh; }
+  .cmp:-webkit-full-screen { border-radius: 0; box-shadow: none; width: 100vw; height: 100vh; }
+  .cmp::backdrop { background: #05070c; }
   .placeholder {
     display: flex; flex-direction: column; align-items: center; gap: 6px;
     color: var(--muted); font-size: 13px; text-align: center; padding: 24px;
@@ -320,11 +431,19 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     align-self: stretch; width: 100%; height: 100%;
     display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px;
   }
+  /* overflow:hidden：并排模式下两格各自的图要裁在自己格子里，否则放大后会互相压过去 */
   .pane {
-    position: relative; margin: 0; min-height: 0; height: 100%;
+    position: relative; margin: 0; min-height: 0; height: 100%; overflow: hidden;
     display: flex; align-items: center; justify-content: center;
   }
   .pane img { max-width: 100%; max-height: 100%; display: block; }
+  /* 每格自己的变换层（并排 = 每格一个独立视口）。与 .zoom-layer 同一套前提：
+     零 padding / border + transform-origin: 0 0 —— 只这样才能保证同一个 (k, tx, ty)
+     施加到两格上时，"看得见的归一化区域"完全一致（两格等大）。裁剪交给 .pane 的 overflow:hidden。 */
+  .pane-zoom {
+    position: absolute; inset: 0; transform-origin: 0 0;
+    display: flex; align-items: center; justify-content: center;
+  }
   /* 还没有标注图时右格是空的：给一句占位说明，避免看起来像渲染坏了。
      用伪元素而不是额外元素，是为了不引入"永远取不到"的 id。 */
   .cmp-side.no-anno .pane:last-child::after {
@@ -334,6 +453,8 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     position: absolute; top: 0; left: 0; z-index: 3;
     background: rgba(10, 15, 25, .82); border: 1px solid var(--line);
     border-radius: 6px; padding: 2px 8px; font-size: 11px; color: var(--muted);
+    /* 角标在变换层内，会随缩放一起变大：反向缩回，屏幕上尺寸恒定（见文件头「五」） */
+    transform: scale(calc(1 / var(--zk))); transform-origin: left top;
   }
   /* 原图是流内元素，被 max-width/max-height 收缩到"恰好容纳"的尺寸；
      syncFrame() 再量它的 getBoundingClientRect()，把标注层精确盖上去。 */
@@ -343,14 +464,18 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     position: absolute; top: 6px; z-index: 6; pointer-events: none;
     background: rgba(10, 15, 25, .82); border: 1px solid var(--line);
     border-radius: 6px; padding: 2px 8px; font-size: 11px; color: var(--muted);
+    transform: scale(calc(1 / var(--zk))); transform-origin: left top;
   }
   .stack-tag.tag-left { left: 6px; }
-  .stack-tag.tag-right { right: 6px; }
+  .stack-tag.tag-right { right: 6px; transform-origin: right top; }
   /* 叠加模式下两张图叠在一起，左右标签会误导，直接隐藏 */
   .cmp.overlay-mode .stack-tag { display: none; }
   .cmp-overlay img { width: 100%; height: 100%; display: block; }
+  /* 分隔线与手柄都在 overlay 内（局部坐标），会随缩放一起变粗变大：
+     用 --zk = 1/k 反向补偿，保证屏幕上始终是 2px 线与 34px 手柄，命中区域也不随缩放变化。 */
   .slider-line {
-    position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+    position: absolute; top: 0; bottom: 0;
+    width: calc(2px / var(--zk)); margin-left: calc(-1px / var(--zk));
     background: var(--accent); z-index: 4; pointer-events: none;
   }
   .slider-handle {
@@ -359,6 +484,7 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     display: flex; align-items: center; justify-content: center;
     font-size: 14px; cursor: ew-resize; z-index: 5;
     box-shadow: 0 2px 10px rgba(0, 0, 0, .55);
+    transform: scale(calc(1 / var(--zk)));   /* 默认 origin 是自身中心，中心点不动 */
   }
   /* 叠加模式：同一个 stack，只是藏掉分隔线并给标注图加透明度 */
   .cmp.overlay-mode .slider-line,
@@ -459,6 +585,9 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     .col-left { order: 1; }
     .col-right { order: 3; }
     .cmp { flex: 0 0 auto; height: 58vh; min-height: 260px; }
+    /* 单列里不存在"左右让宽度"，所以忽略左栏折叠状态；开关本身也没意义，直接藏掉 */
+    .layout.left-collapsed .left-stack { display: flex; }
+    .left-toggle { display: none; }
     .console-body { max-height: 52vh; overflow: auto; }
     /* 单列里没有"竖条"这回事：折叠就只是收起正文，标题行（含最新信息）始终可见 */
     .layout.console-collapsed .console-title { display: block; }
@@ -491,6 +620,12 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
 
   <!-- ======================= 左栏：控制 ======================= -->
   <section class="col col-left" aria-label="控制面板">
+
+    <!-- 左栏折叠：把控制面板整体收成一条竖条，把宽度让给中栏对比区（与右栏控制台折叠同一套写法）。
+         开关必须留在栏内最上方，折叠后仍然可见可点，否则用户没法再展开。 -->
+    <button class="left-toggle" type="button" id="btnToggleLeft" aria-expanded="true"
+            aria-controls="leftStack" title="折叠左栏控制面板，把宽度让给对比区">◀ 收起左栏</button>
+    <div class="left-stack" id="leftStack">
 
     <!-- ① 图片源：上传 / URL / 内置测试图，同一件事的三个入口合并到一张卡 -->
     <div class="card">
@@ -581,6 +716,7 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
       </div>
       <p class="hint">不调模型：直接把坐标画到当前图片上，用于离线验证对比查看与真值打分。</p>
     </div>
+    </div><!-- /#leftStack -->
   </section>
 
   <!-- ======================= 中栏：对比查看区（主角） ======================= -->
@@ -606,14 +742,24 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
           <span>从左侧任选一种来源载入：本地上传 / 图片 URL / 内置测试图</span>
         </div>
 
+        <!-- 变换层：并排容器与滑块/叠加 stack 都包在这里面，缩放/平移只作用于这一层的 transform。
+             占位符 #stageEmpty 与下面的工具条刻意留在层外：前者不该被缩放，后者不该跟着图片跑。
+             ⚠️ 别给这一层加 padding / border，也别改 transform-origin —— syncFrame 靠
+             "(屏幕 rect 差) / k = 局部坐标" 精确盖住图片，这两个前提一破就会错位（见文件头「五」）。 -->
+        <div class="zoom-layer" id="zoomLayer">
+
         <div class="cmp-side" id="modeSide" hidden>
+          <!-- 并排模式下**每一格都是独立视口**：缩放/平移施加在各自 .pane-zoom 上（两格等大 ⇒
+               同一个 (k, tx, ty) 让两格看到完全相同的归一化区域）。
+               曾经只缩放外层那个公共变换层：两格被一起推出去，一格露左半、一格露右半，
+               同一张图被劈成互不重叠的两块（复现见 runs/probe_side_zoom.mjs，说明见文件头「五」）。 -->
           <figure class="pane">
             <figcaption class="pane-tag">打标前 · 原图</figcaption>
-            <img id="sideBefore" alt="打标前的原图" />
+            <div class="pane-zoom" id="paneZoomBefore"><img id="sideBefore" alt="打标前的原图" /></div>
           </figure>
           <figure class="pane">
             <figcaption class="pane-tag">打标后 · 标注图</figcaption>
-            <img id="sideAfter" alt="打标后的标注图" />
+            <div class="pane-zoom" id="paneZoomAfter"><img id="sideAfter" alt="打标后的标注图" /></div>
           </figure>
         </div>
 
@@ -630,6 +776,19 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
           <div class="slider-handle" id="sliderHandle" role="slider" tabindex="0"
                aria-label="对比分隔线位置" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"
                aria-orientation="horizontal" title="拖动或用左右方向键调整">⇆</div>
+        </div>
+        </div><!-- /#zoomLayer -->
+
+        <!-- 缩放工具条：浮动在对比区底部居中，不占图片的垂直空间（绝对定位、在变换层之外）。
+             每个按钮都有 aria-label，Tab 可聚焦；显示的是**真实像素比例**，
+             所以「1:1」恰好是 100%，而「适应」通常小于 100%。 -->
+        <div class="zoom-bar" id="zoomBar" role="group" aria-label="图片缩放与查看" hidden>
+          <button class="btn tiny ghost" type="button" id="btnZoomOut" aria-label="缩小图片">−</button>
+          <span class="zoom-label" id="zoomLabel" aria-live="off" title="当前显示比例（相对原图像素）">100%</span>
+          <button class="btn tiny ghost" type="button" id="btnZoomIn" aria-label="放大图片">＋</button>
+          <button class="btn tiny" type="button" id="btnZoomFit" aria-label="适应窗口（整图可见）" aria-pressed="true">适应</button>
+          <button class="btn tiny" type="button" id="btnZoom1x" aria-label="实际大小 1:1" aria-pressed="false">1:1</button>
+          <button class="btn tiny" type="button" id="btnZoomFull" aria-label="全屏查看对比区">⛶ 全屏</button>
         </div>
       </div>
 
@@ -729,7 +888,13 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     run: { token: 0, active: false, controller: null, started: 0, rounds: 0, finished: false, gotAnnotated: false, failed: false },
     result: { annotatedUrl: null, items: null, summary: null, accuracy: null },
     stream: { latest: "", reasoningChars: 0, contentChars: 0, toolCalls: 0, events: 0 },
-    view: { mode: "side", split: 50, opacity: 0.65, thinking: true, effort: "", consoleCollapsed: false, thinkingTouched: false },
+    view: {
+      mode: "side", split: 50, opacity: 0.65, thinking: true, effort: "",
+      consoleCollapsed: false, thinkingTouched: false,
+      // 缩放/平移：zoom = 变换层系数 k，ratio = 显示比例（custom 模式的用户意图），
+      // zoomMode = fit/custom；fit 时强制 k=1、平移归零（见文件头「五、缩放 / 平移 / 全屏」）
+      zoom: 1, ratio: 1, zoomMode: "fit", panX: 0, panY: 0, leftCollapsed: false,
+    },
     alerts: [],
     samples: [],
   };
@@ -903,23 +1068,32 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
   // 把标注层精确盖到"原图实际显示矩形"上。
   // 原图由浏览器按 max-width/max-height 收缩（等价于 contain，且元素自身没有留白），
   // 因此量它的 rect 就得到了图片内容矩形——clip-path 的百分比天然等于图片的百分比。
+  //
+  // ⚠️ 必须"变换无关"：overlay 与原图同在 #zoomLayer 内，overlay 的 left/top/width/height
+  // 是**未变换的局部坐标**（相对变换层的 padding box），而 getBoundingClientRect() 给的是
+  // 变换后的屏幕坐标。所以要先减掉变换层的屏幕原点，再除以缩放系数 k。
+  // 前提三条：① 变换层没有 padding / border；② transform-origin 是 0 0；③ k 就是写在
+  // transform 上的那个系数。缺一条这里就会错位——改动变换层时必须同时满足。
   function syncFrame() {
-    const stage = $("cmpStage");
+    const layer = $("zoomLayer");
     const before = $("stackBefore");
     const overlay = $("stackOverlay");
-    if (!stage || !before || !overlay || before.hidden || overlay.hidden) return;
-    const sr = stage.getBoundingClientRect();
+    if (!layer || !before || !overlay || before.hidden || overlay.hidden) return;
     const br = before.getBoundingClientRect();
     if (!br.width || !br.height) return;
-    overlay.style.left = (br.left - sr.left) + "px";
-    overlay.style.top = (br.top - sr.top) + "px";
-    overlay.style.width = br.width + "px";
-    overlay.style.height = br.height + "px";
+    const k = layerK();     // 并排模式下 #zoomLayer 是单位变换，不能拿 state.view.zoom 去除
+    const lr = layer.getBoundingClientRect();
+    overlay.style.left = ((br.left - lr.left) / k) + "px";
+    overlay.style.top = ((br.top - lr.top) / k) + "px";
+    overlay.style.width = (br.width / k) + "px";
+    overlay.style.height = (br.height / k) + "px";
   }
   function applySplit() {
     const pct = clamp(state.view.split, 0, 100);
-    // 从左侧切掉 pct%：分割线左边露出底层原图，右边是标注图，与并排模式同向
-    $("stackAfter").style.clipPath = "inset(0 0 0 " + pct + "%)";
+    // 从左侧切掉 pct%：分割线左边露出底层原图，右边是标注图，与并排模式同向。
+    // 叠加模式不用分割线，必须显式清掉裁剪：clip-path 是行内样式，落在 stackAfter 上不会自己消失，
+    // 否则"先拖滑块再切叠加"会看到标注图缺了一块（看起来像标注少了半边）。
+    $("stackAfter").style.clipPath = state.view.mode === "overlay" ? "none" : "inset(0 0 0 " + pct + "%)";
     $("sliderLine").style.left = pct + "%";
     $("sliderHandle").style.left = pct + "%";
     $("sliderHandle").setAttribute("aria-valuenow", String(Math.round(pct)));
@@ -966,7 +1140,248 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     } else {
       $("viewerMeta").textContent = "打标前 / 打标后（等待标注结果）";
     }
-    if (stacked) scheduleSyncFrame();
+    applySplit();       // 模式的切换同样影响裁剪（叠加模式必须清掉滑块留下的 clip-path）
+    // 模式切换会换掉"承载 transform 的元素"（并排 = 每格一层 / 滑块·叠加 = 共用一个 stack 层），
+    // 所以必须重写 transform；applyZoom 内部已经带上 scheduleSyncFrame + renderZoomBar
+    // （并排与 stack 的 fit 基准不同，比例标签也正好跟着刷新）。
+    applyZoom();
+  }
+
+  /* ----------------------------------------------------------------------
+   * 6.1 缩放 / 平移 / 全屏
+   * 交互模型与"变换无关"的几何前提见文件头「五、缩放 / 平移 / 全屏」。
+   * -------------------------------------------------------------------- */
+  const ZOOM_MIN = 0.1, ZOOM_MAX = 8, ZOOM_STEP = 1.25;
+  // 几何基准图：滑块/叠加模式量 stack 里的原图，并排模式量左格的图（两张 naturalWidth 相同）
+  function baseImageEl() { return $("modeSide").hidden ? $("stackBefore") : $("sideBefore"); }
+  // 该模式下真正承载 transform 的元素（见文件头「五」）：
+  //   并排 → 两格各自的 .pane-zoom，**每格是一个独立视口**；
+  //   滑块 / 叠加 → 唯一的 #zoomLayer，两张图重合在同一个视口里。
+  // 两类元素都满足"零 padding / border + transform-origin: 0 0"，所以 syncFrame 与锚点公式通用。
+  function transformTargets() {
+    return $("modeSide").hidden ? [$("zoomLayer")] : [$("paneZoomBefore"), $("paneZoomAfter")];
+  }
+  // #zoomLayer 当前真正生效的 k：并排模式下变换在每格自己的层上，#zoomLayer 是单位变换
+  function layerK() { return $("modeSide").hidden ? (state.view.zoom || 1) : 1; }
+  // 鼠标落在哪一格上，锚点就用哪一格的未变换原点（两格等大，共用一套公式）。
+  // ⚠️ 不能用另一格的原点：两格分别以自己左上角为原点，混用会差 (O₁−O₀)·(1−k′/k)，
+  // 两格看到的区域就不再一致。没落在任何一格（落在缝隙里）时退回左格；
+  // 滑块 / 叠加模式恒为 #zoomLayer。
+  function anchorLayer(clientX, clientY) {
+    if ($("modeSide").hidden) return $("zoomLayer");
+    const panes = [$("paneZoomBefore"), $("paneZoomAfter")];
+    const hit = panes.find((el) => {
+      const r = el.parentElement.getBoundingClientRect();   // 父节点 = .pane，就是这一格的裁剪窗口
+      return clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom;
+    });
+    return hit || panes[0];
+  }
+  // 把 (k, tx, ty) 写到某个变换元素上（单位变换就清成空串，交回浏览器原生排版）。
+  // --zk = 1/k 挂在**被变换的那个元素**上：只有它里面的分隔线 / 手柄 / 角标需要反向缩回，
+  // .pane-tag 在 .pane 里（不在 .pane-zoom 内）不该被反缩，于是它继承到的是 #zoomLayer 的 --zk。
+  function setTransform(el, k, tx, ty) {
+    if (!el) return;
+    el.style.transform = (k === 1 && !tx && !ty)
+      ? "" : "translate(" + tx + "px," + ty + "px) scale(" + k + ")";
+    el.style.setProperty("--zk", String(1 / (k || 1)));
+  }
+  // 量出"视口的未变换盒子"与"图片的未变换矩形"，统一换算到同一个未变换坐标系里。
+  // 变换是 translate 后再 scale、origin 为 0 0，于是：
+  //   未变换.left = rect.left − tx，未变换.width = rect.width / k，图片局部坐标 = (rect.left − ux − tx) / k
+  // 这样后面算钳制 / 居中都不必关心"当前缩放到哪儿了"。
+  function measureViewport() {
+    const v = state.view;
+    const el = baseImageEl();
+    const vp = transformTargets()[0];
+    if (!el || !vp || !el.naturalWidth) return null;
+    const k = v.zoom || 1;
+    const vr = vp.getBoundingClientRect();
+    const ux = vr.left - v.panX, uy = vr.top - v.panY;
+    const uw = vr.width / k, uh = vr.height / k;
+    if (!uw || !uh) return null;
+    const ir = el.getBoundingClientRect();
+    return {
+      ux: ux, uy: uy, uw: uw, uh: uh,
+      ix: (ir.left - ux - v.panX) / k, iy: (ir.top - uy - v.panY) / k,
+      iw: ir.width / k, ih: ir.height / k,
+    };
+  }
+  // 平移钳制：图片至少留 MIN_VISIBLE 像素在视口里。没有它，用户把图拖出去就是"图没了"；
+  // 有它则任何一次拖动之后画面都还在（配合「适应」「1:1」两个复位按钮）。
+  const MIN_VISIBLE = 32;
+  function clampPan(k, tx, ty) {
+    const m = measureViewport();
+    if (!m) return [tx, ty];
+    const left = m.ux + tx + k * m.ix, top = m.uy + ty + k * m.iy;
+    const right = left + k * m.iw, bottom = top + k * m.ih;
+    const mx = Math.min(MIN_VISIBLE, k * m.iw), my = Math.min(MIN_VISIBLE, k * m.ih);
+    if (right < m.ux + mx) tx += m.ux + mx - right;
+    else if (left > m.ux + m.uw - mx) tx -= left - (m.ux + m.uw - mx);
+    if (bottom < m.uy + my) ty += m.uy + my - bottom;
+    else if (top > m.uy + m.uh - my) ty -= top - (m.uy + m.uh - my);
+    return [tx, ty];
+  }
+  // 把图片摆到视口正中（给「1:1」用；见 setZoomOneToOne）
+  function centerPan(k) {
+    const m = measureViewport();
+    if (!m) return [0, 0];
+    return [m.uw / 2 - k * (m.ix + m.iw / 2), m.uh / 2 - k * (m.iy + m.ih / 2)];
+  }
+  // fit 基准 = 图片"未变换"时的显示宽度 ÷ 原始像素宽度（只跟布局有关，与 k 无关）。
+  // 入参 k 必须是**当前屏幕上真正生效的系数**：rect 已经含了变换，要除回去才是布局宽度。
+  function measureFitRatio(k) {
+    const el = baseImageEl();
+    if (!el || !el.naturalWidth) return 1;
+    const w = el.getBoundingClientRect().width / (k || 1);
+    return w > 0 ? w / el.naturalWidth : 1;
+  }
+  function fitRatio() { return measureFitRatio(state.view.zoom || 1); }
+  // 标签上的显示比例 = 真实像素比例：custom 模式以 ratio 为准，fit 模式就等于当前 fit 基准
+  function displayRatio() {
+    return state.view.zoomMode === "fit" ? fitRatio() : (state.view.ratio || fitRatio());
+  }
+  // 状态 → transform。zoomMode === "fit" 时强制单位变换（浏览器排版本身就是 contain，不必补偿）。
+  // custom 模式由 ratio 反推 k = ratio / fitRatio，这样容器尺寸变化时显示比例不变——
+  // 「1:1」必须始终真的是 1 图像像素 = 1 CSS 像素，写死 k 做不到（见文件头「五」）。
+  function applyZoom() {
+    const v = state.view;
+    const fr = measureFitRatio(v.zoom || 1);   // 必须在改动之前量：此刻屏幕上的 k 就是 v.zoom
+    let k, tx, ty;
+    if (v.zoomMode === "fit") { k = 1; tx = 0; ty = 0; v.ratio = fr; }
+    else { k = clamp((v.ratio || fr) / (fr || 1), 1e-4, 1e4); tx = v.panX; ty = v.panY; }
+    const p = clampPan(k, tx, ty);             // 同上：它读的是"当前生效"的 k / 平移，必须在改 state 之前调
+    tx = p[0]; ty = p[1];
+    v.zoom = k; v.panX = tx; v.panY = ty;
+    // 并排模式把 (k, tx, ty) 写到两格各自的层上（每格独立视口，两格因此看到同一块归一化区域）；
+    // 另一模式的元素一律清成单位变换，切换模式后不会有残留。
+    const side = !$("modeSide").hidden;
+    setTransform($("zoomLayer"), side ? 1 : k, side ? 0 : tx, side ? 0 : ty);
+    setTransform($("paneZoomBefore"), side ? k : 1, side ? tx : 0, side ? ty : 0);
+    setTransform($("paneZoomAfter"), side ? k : 1, side ? tx : 0, side ? ty : 0);
+    renderZoomBar();
+    scheduleSyncFrame();   // transform 不改布局，但覆盖层要用新的 k 重算局部坐标
+  }
+  function renderZoomBar() {
+    const has = !!state.image.url;
+    const ratio = has ? displayRatio() : 1;
+    $("cmpStage").classList.toggle("can-pan", has);        // 可拖动时才给 grab 光标
+    $("zoomBar").hidden = !has;
+    $("zoomLabel").textContent = Math.round(ratio * 100) + "%";
+    const fit = state.view.zoomMode === "fit";
+    $("btnZoomFit").setAttribute("aria-pressed", String(fit));
+    $("btnZoom1x").setAttribute("aria-pressed", String(!fit && Math.abs(ratio - 1) < 0.005));
+    $("btnZoomIn").disabled = !has || ratio >= ZOOM_MAX - 1e-6;
+    $("btnZoomOut").disabled = !has || ratio <= ZOOM_MIN + 1e-6;
+  }
+  // 以屏幕点 (clientX, clientY) 为锚点缩放到 ratio（ratio 是"显示比例"，1 = 原始像素大小）。
+  // 设变换层未变换时的原点是 L（client 坐标），局部点 p 满足 screen = L + t + k·p，
+  // 于是 p = (c − L − t) / k；缩放后要求同一个 p 仍落在 c 上：
+  //     L + t' + k'·p = c   ⇒   t' = (c − L) − k'·p
+  // 这样"指针下方的那个图像点"在缩放前后不动，是体验的关键。
+  function zoomTo(ratio, clientX, clientY) {
+    const v = state.view;
+    if (v.zoomMode === "fit") { v.zoom = 1; v.panX = 0; v.panY = 0; }
+    const k = v.zoom || 1;
+    const fr = measureFitRatio(k);
+    const nextRatio = clamp(ratio, ZOOM_MIN, ZOOM_MAX);
+    const k2 = clamp(nextRatio / (fr || 1), 1e-4, 1e4);
+    // 并排模式下必须用**鼠标所在那一格**的原点（两格是各自独立的视口）
+    const lr = anchorLayer(clientX, clientY).getBoundingClientRect();
+    const originX = lr.left - v.panX;    // 扣掉 translate 才是变换层的未变换原点
+    const originY = lr.top - v.panY;
+    const px = (clientX - originX - v.panX) / k;
+    const py = (clientY - originY - v.panY) / k;
+    // 只记"用户要的比例"；k 交给 applyZoom 从 ratio 反推，且此时 v.zoom 还没变，
+    // 它量到的 fit 基准与这里算 k2 用的完全一致，不会出现"用新 k 除旧 rect"的错位。
+    v.ratio = nextRatio;
+    v.panX = (clientX - originX) - k2 * px;
+    v.panY = (clientY - originY) - k2 * py;
+    v.zoomMode = "custom";               // 手工调过就不再是"严格适应窗口"
+    applyZoom();
+  }
+  function zoomToCenter(ratio) {
+    const r = $("cmpStage").getBoundingClientRect();
+    zoomTo(ratio, r.left + r.width / 2, r.top + r.height / 2);
+  }
+  // 适应窗口 = 回到浏览器排版的 contain 状态（单位变换、无平移）：任何缩放下点它都必然整图可见
+  function setZoomFit() { state.view.zoomMode = "fit"; applyZoom(); }
+  // 1:1 = 一图像素对一 CSS 像素。这里**顺带把画面摆到视口正中**：若沿用旧的平移量，
+  // 图片完全可能正好停在视口外（点了 1:1 却什么都看不到）。需求是这两个按钮在任何缩放下
+  // 都能把画面恢复成可用状态，所以 1:1 刻意不做"位置继承"，宁可回到居中的干净状态。
+  function setZoomOneToOne() {
+    const v = state.view;
+    if (v.zoomMode === "fit") { v.zoom = 1; v.panX = 0; v.panY = 0; }
+    const fr = measureFitRatio(v.zoom || 1);
+    const k = clamp(1 / (fr || 1), 1e-4, 1e4);
+    const c = centerPan(k);              // 必须用旧的 (k, 平移) 来量，故放在改 v.panX 之前
+    v.ratio = 1; v.zoomMode = "custom";
+    v.panX = c[0]; v.panY = c[1];
+    applyZoom();
+  }
+  function toggleFullscreen() {
+    const stage = $("cmpStage");
+    const doc = document;
+    const current = doc.fullscreenElement || doc.webkitFullscreenElement;
+    const exit = doc.exitFullscreen || doc.webkitExitFullscreen;      // 老 WebKit 只有带前缀的版本
+    const enter = stage.requestFullscreen || stage.webkitRequestFullscreen;
+    try {
+      if (current) { if (exit) exit.call(doc); }
+      else if (enter) { const p = enter.call(stage); if (p && p.catch) p.catch(() => {}); }
+    } catch (e) { /* 浏览器不支持或策略拒绝：静默忽略，其余功能不受影响 */ }
+  }
+  function bindZoom() {
+    const stage = $("cmpStage");
+    // wheel 必须显式 passive:false，否则 preventDefault 无效，页面会跟着一起滚
+    stage.addEventListener("wheel", (e) => {
+      if (!state.image.url) return;                     // 没图的时候不劫持页面滚动
+      e.preventDefault();
+      const unit = e.deltaMode === 1 ? 0.05 : 0.0016;   // 行模式(1)的 deltaY 是"行数"，量级不同
+      zoomTo(displayRatio() * Math.exp(-e.deltaY * unit), e.clientX, e.clientY);
+    }, { passive: false });
+
+    // 平移：Pointer Events + 指针捕获（拖到窗口外也不丢事件）。
+    let pan = null;
+    stage.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0 || !state.image.url) return;
+      // 分隔线手柄与缩放工具条各有职责：按下它们不能开始平移，否则会互相抢手势
+      if (e.target.closest && (e.target.closest("#sliderHandle") || e.target.closest("#zoomBar"))) return;
+      pan = { id: e.pointerId, x: e.clientX, y: e.clientY, px: state.view.panX, py: state.view.panY };
+      try { stage.setPointerCapture(e.pointerId); } catch (err) { /* 不支持捕获也能用，拖出窗口会断 */ }
+      stage.classList.add("panning");
+      e.preventDefault();                               // 顺带挡掉图片原生拖拽与文本选择
+    });
+    stage.addEventListener("pointermove", (e) => {
+      if (!pan || e.pointerId !== pan.id) return;
+      state.view.panX = pan.px + (e.clientX - pan.x);
+      state.view.panY = pan.py + (e.clientY - pan.y);
+      state.view.zoomMode = "custom";                   // 平移过就不再是"严格适应窗口"
+      applyZoom();
+    });
+    const endPan = (e) => {
+      if (!pan || (e && e.pointerId !== pan.id)) return;
+      try { stage.releasePointerCapture(pan.id); } catch (err) { /* 之前没捕获成功 */ }
+      pan = null;
+      stage.classList.remove("panning");
+    };
+    stage.addEventListener("pointerup", endPan);
+    stage.addEventListener("pointercancel", endPan);
+
+    // 双击在「适应窗口」与「1:1」之间互切：这两个是最常用的档位，比"一律复位"少点一次按钮
+    stage.addEventListener("dblclick", (e) => {
+      if (!state.image.url) return;
+      if (e.target.closest && e.target.closest("#zoomBar")) return;
+      if (state.view.zoomMode === "fit") setZoomOneToOne(); else setZoomFit();
+    });
+
+    $("btnZoomIn").addEventListener("click", () => zoomToCenter(displayRatio() * ZOOM_STEP));
+    $("btnZoomOut").addEventListener("click", () => zoomToCenter(displayRatio() / ZOOM_STEP));
+    $("btnZoomFit").addEventListener("click", setZoomFit);
+    $("btnZoom1x").addEventListener("click", setZoomOneToOne);
+    $("btnZoomFull").addEventListener("click", toggleFullscreen);
+    // 进出全屏会重新排版：几何要重算；缩放状态存在 state.view 里，不受影响。
+    // 标签刷新交给 ResizeObserver（它观察的正是 #cmpStage）。
+    ["fullscreenchange", "webkitfullscreenchange"].forEach((name) =>
+      document.addEventListener(name, scheduleSyncFrame));
   }
 
   /* ======================================================================
@@ -1118,6 +1533,16 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     btn.textContent = state.view.consoleCollapsed ? "展开" : "折叠";
     scheduleSyncFrame();      // 中栏变宽，覆盖层要重新贴合图片矩形
   }
+  // 左栏折叠：与 setConsoleCollapsed 同一套写法（class 挂在 #layout 上，具体样式交给 CSS）。
+  // 目的是把左栏宽度让给中栏——用户的核心诉求就是"图片显示得太小"。
+  function setLeftCollapsed(collapsed) {
+    state.view.leftCollapsed = !!collapsed;
+    $("layout").classList.toggle("left-collapsed", state.view.leftCollapsed);
+    const btn = $("btnToggleLeft");
+    btn.setAttribute("aria-expanded", String(!state.view.leftCollapsed));
+    btn.textContent = state.view.leftCollapsed ? "展开左栏 ▶" : "◀ 收起左栏";
+    scheduleSyncFrame();      // 中栏变宽，覆盖层要重新贴合图片矩形
+  }
   function setSectionCollapsed(btnId, bodyId, collapsed) {
     $(btnId).setAttribute("aria-expanded", String(!collapsed));
     $(bodyId).hidden = collapsed;
@@ -1164,6 +1589,7 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     $("stackBefore").src = record.url;
     setStatus("图片已就绪（" + record.width + "×" + record.height + "），可以发起识别。", "ok");
     renderAll();
+    setZoomFit();            // 换图复位到"适应窗口"：沿用上一张的倍率/平移会看不到全貌
     scheduleSyncFrame();
     if (state.image.sample && state.image.sample.evaluable) {
       pushAlert("info", "已载入带真值的测试图「" + state.image.sample.title + "」，识别完成后由程序自动打分。");
@@ -1513,11 +1939,14 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     };
     const move = (e) => { if (dragging) setFromClientX(e.touches ? e.touches[0].clientX : e.clientX); };
     const up = () => { dragging = false; };
-    overlay.addEventListener("mousedown", down);
+    // 只在手柄上按下才拖分隔线（原先是整块 overlay 都能拖）。
+    // 原因：对比区现在还有"按住左键拖动 = 平移图片"的手势，两者都是按住左键横向拖，
+    // 必须按元素分工，否则拖图会把分隔线一起带跑。手柄之外一律交给平移。
+    handle.addEventListener("mousedown", down);
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
-    overlay.addEventListener("touchstart", down, { passive: true });
-    overlay.addEventListener("touchmove", move, { passive: true });
+    handle.addEventListener("touchstart", down, { passive: true });
+    window.addEventListener("touchmove", move, { passive: true });   // 与 mousemove 一致：拖出手柄也不断
     window.addEventListener("touchend", up);
     handle.addEventListener("keydown", (e) => {
       const step = e.shiftKey ? 10 : 2;
@@ -1654,6 +2083,7 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     // ---- 控制台 ----
     $("btnClearOutput").addEventListener("click", () => { resetStream(); setLatest("控制台已清空"); });
     $("btnToggleConsole").addEventListener("click", () => setConsoleCollapsed(!state.view.consoleCollapsed));
+    $("btnToggleLeft").addEventListener("click", () => setLeftCollapsed(!state.view.leftCollapsed));
     $("btnToggleReasoning").addEventListener("click", () => toggleSection("btnToggleReasoning", "logReasoning"));
     $("btnToggleContent").addEventListener("click", () => toggleSection("btnToggleContent", "logContent"));
     $("btnToggleTools").addEventListener("click", () => toggleSection("btnToggleTools", "logTools"));
@@ -1683,14 +2113,20 @@ POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS
     setSource("sample");
     $("consoleRail").hidden = false;      // 显隐完全交给 CSS（只有折叠时才显示）
     setConsoleCollapsed(false);
+    setLeftCollapsed(false);
     applySplit();
     applyOpacity();
     renderAll();
     bindEvents();
     bindSlider();
-    // 图片解码完成前 getBoundingClientRect 量到的是 0，覆盖层会贴不上，必须等 load
-    $("stackBefore").addEventListener("load", scheduleSyncFrame);
-    if (window.ResizeObserver) new ResizeObserver(scheduleSyncFrame).observe($("cmpStage"));
+    bindZoom();
+    // 图片解码完成前 getBoundingClientRect 量到的是 0，覆盖层会贴不上，必须等 load。
+    // 比例标签也要一起刷新：它靠"布局宽度 ÷ 原始像素宽度"算，图没加载完算不出来。
+    $("stackBefore").addEventListener("load", () => { scheduleSyncFrame(); renderZoomBar(); });
+    // 比例标签也依赖"图已解码"：没解码时量到的宽度是 0，算不出比例
+    // 对比区尺寸一变（折叠左右栏 / 进出全屏 / 改窗口）：几何、比例标签、以及 custom 模式下
+    // 由 ratio 反推的 k 都要重算，所以直接走 applyZoom（它内部已经带上这两步）
+    if (window.ResizeObserver) new ResizeObserver(() => applyZoom()).observe($("cmpStage"));
     window.addEventListener("resize", scheduleSyncFrame);
     loadHealth();
     loadSampleCatalog();
