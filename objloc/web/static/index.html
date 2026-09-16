@@ -1,0 +1,1706 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DeepSeek 物体定位 · 打标对比演示台</title>
+<!--
+================================================================================
+DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTML+CSS+JS）
+================================================================================
+
+@doc README.md#6-web-api        —— 本页调用的全部接口与 SSE 事件清单
+@doc README.md#7-坐标约定        —— 一切坐标都是 0.0~1.0 相对比例
+@doc README.md#8-思考模式开关     —— thinking / reasoning_effort 的三层开关
+@doc AGENTS.md#4.1-流式事件协议   —— SSE 事件类型与字段名（改后端时要同步这里）
+@doc AGENTS.md#4.3-坐标约定       —— 旧刻度兜底与 coord_space 诊断的由来
+@doc objloc/samples.py           —— 内置测试图目录（GET /api/samples 的数据源）
+
+--------------------------------------------------------------------------------
+一、信息架构：为什么这样分区
+--------------------------------------------------------------------------------
+产品的核心动作只有一条主线：选图 → 发起识别 → 看「打标前 / 打标后」→ 读流式输出与自动打分。
+旧版把「选择图片」和「测试图片」拆成两张卡，同一件事（把一张图变成当前图片）有两个入口，
+用户得先判断"我该走哪张卡"。新版按**一件事一处入口**重排：
+
+  · 顶部告警条（#alertBar）—— 只放「错误 / 告警 / 需要人介入的提示」，写进 DOM 就不会丢。
+    旧版把错误混进流式日志，长输出一滚就找不到了，这是本次最重要的可用性修复。
+  · 左栏（控制）—— ① 图片源（三个来源合并成一张卡的三个 Tab）
+                     ② 识别参数（提示词 / 工具 / 思考 / 强度 / 发起与取消）
+                     ③ 手动标注（离线工具，与模型链路无关，故单独成卡）
+  · 中栏（对比查看区）—— 主角。占满剩余高度，三种对比模式 + 结果指标条。
+  · 右栏（控制台）—— 配角。思考过程 / 正文 / 工具执行三段各自独立、可折叠，
+    并常驻一行「最新关键信息」；整栏还能折叠成 56px 竖条，把宽度还给对比区。
+
+「行为状态」也按这个分层各归其位：操作进度 → 左栏状态行(#statusLine)；
+错误与告警 → 顶部告警条；模型输出 → 右栏控制台。三者不再互相覆盖。
+
+--------------------------------------------------------------------------------
+二、状态模型：一个 state + 若干纯渲染函数
+--------------------------------------------------------------------------------
+旧版有 44 个 DOM id、172 个顶层符号平铺在全局，且大量"就地改 DOM"，
+导致同一份事实在多个地方各写一遍（按钮禁用、状态文案、标注图 src 都有多份写点）。
+新版只有**一个可变的 state 对象**（见下方 state 声明），所有界面都是它的投影：
+
+    state.image  当前图片（含 sampleId / groundTruth，来自内置测试图时为真值）
+    state.run    本轮识别的运行态（token / active / controller / 轮次 / 是否已出标注图）
+    state.result 结果（annotatedUrl / items / summary / accuracy）
+    state.stream 流式计数与"最新一行"
+    state.view   纯 UI 偏好（对比模式 / 分隔线位置 / 不透明度 / 思考开关 / 控制台折叠）
+    state.alerts 顶部告警条的内容栈
+
+改动状态后调用对应的 renderXxx()，不在事件回调里零散地碰 DOM。
+渲染函数是幂等的：任何时刻重跑一遍都能得到与状态一致的界面。
+
+--------------------------------------------------------------------------------
+三、事件流：为什么需要 token
+--------------------------------------------------------------------------------
+POST /api/detect 返回 text/event-stream，事件类型与字段见 @doc AGENTS.md#4.1-流式事件协议：
+
+    round_start {index, thinking}   reasoning {text}      content {text}
+    tool_call   {id,name,arguments} tool_result {id,name,ok,content,elapsed_ms}
+    message     {message,finish_reason}  done {reason,content,rounds,thinking,messages}
+    annotated   {url,summary,items,accuracy?}   warning {message,coord_warnings?}
+    error       {message}     eof {}
+
+关键竞态：识别途中换图 / 重新识别 / 取消时，旧请求的 SSE 事件仍在路上。
+若不丢弃，上一张图的标注图、目标列表、准确率会被写到新图的状态里——
+这类错配看起来像"程序算错了"，实际是过期事件。做法：每次开跑自增 state.run.token，
+回调里先比对 token，不等就整条丢弃；fetch 的 AbortController 只负责省流量，
+正确性由 token 保证（abort 是异步的，不能当作同步屏障）。
+
+--------------------------------------------------------------------------------
+四、其余设计取舍
+--------------------------------------------------------------------------------
+1. 滑块 / 叠加的几何不再手算。旧版用「图片宽高比 + 视口高度」反推容器尺寸，
+   一旦容器有 padding、边框或滚动条就会错位。新版让浏览器自己排版：
+   原图作为普通流内元素按 max-width/max-height 收缩到"恰好容纳"的尺寸，
+   标注层再用一次 getBoundingClientRect() 精确覆盖到那张原图的矩形上（syncFrame）。
+   于是 clip-path / 分隔线的百分比天然就是"图片的百分比"，与图片实际显示区域严格对齐。
+2. 并排与滑块/叠加共用同一套图片元素：滑块和叠加只是同一个 stack 的两种表现
+   （叠加 = 隐藏分隔线 + 给标注图加不透明度），少一套 DOM 就少一处不同步。
+3. 窄屏（<1100px）退化为单列：查看区排在最前，控制台折叠后只留标题行（含最新信息）。
+4. 无障碍：Tab 用 role=tab/tablist 且只有一个 tab 可聚焦；分隔线是 role=slider 可聚焦、
+   可用左右方向键调整；关键区域有 aria-label；状态与告警分别用 role=status / aria-live。
+5. 零依赖：不引 npm / CDN / 字体 / 图标库，全部内联。
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f18;
+    --bg-soft: #0e1420;
+    --panel: #121a29;
+    --panel-2: #182135;
+    --line: #243047;
+    --line-soft: #1a2334;
+    --text: #e9eefb;
+    --text-dim: #b9c6de;
+    --muted: #8ea0bf;       /* 与 panel 的对比度约 6:1，正文级可读 */
+    --accent: #5b8cff;
+    --accent-2: #7aa2ff;
+    --accent-soft: rgba(91, 140, 255, .14);
+    --ok: #3ddc97;
+    --warn: #f7b955;
+    --err: #ff7a7a;
+    --radius: 12px;
+    --radius-sm: 8px;
+    --col-left: 344px;
+    --col-right: 404px;
+    --rail: 56px;
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, "Microsoft YaHei", monospace;
+    --sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  /* hidden 属性必须能压过组件自身的 display:flex/grid，否则"隐藏"会失效 */
+  [hidden] { display: none !important; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 20% -10%, #16203a 0%, var(--bg) 60%);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  :focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; border-radius: 4px; }
+  h1, h2, h3 { margin: 0; font-weight: 600; }
+  p { margin: 0; }
+
+  /* ---------------- 顶栏 ---------------- */
+  .topbar {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(90deg, rgba(30, 44, 76, .85), rgba(11, 15, 24, .6));
+    backdrop-filter: blur(6px);
+  }
+  .brand h1 { font-size: 16px; letter-spacing: .2px; }
+  .brand-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .topbar-badges { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px; padding: 4px 10px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+    white-space: nowrap;
+  }
+  .badge.ok { border-color: rgba(61, 220, 151, .45); color: var(--ok); }
+  .badge.warn { border-color: rgba(247, 185, 85, .45); color: var(--warn); }
+  .badge.err { border-color: rgba(255, 122, 122, .5); color: var(--err); }
+
+  /* ---------------- 告警条：错误/告警的唯一去处，不随日志滚走 ---------------- */
+  .alertbar {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 8px 18px; border-bottom: 1px solid var(--line);
+    background: rgba(10, 14, 23, .75);
+  }
+  .alert {
+    display: flex; align-items: flex-start; gap: 10px;
+    border: 1px solid var(--line); border-left-width: 3px;
+    border-radius: var(--radius-sm); padding: 7px 10px; background: var(--panel);
+    font-size: 12.5px;
+  }
+  .alert.error { border-left-color: var(--err); background: rgba(60, 20, 26, .55); }
+  .alert.warn { border-left-color: var(--warn); background: rgba(58, 44, 16, .5); }
+  .alert.info { border-left-color: var(--accent); }
+  .alert.ok { border-left-color: var(--ok); }
+  .alert-kind { flex: 0 0 auto; font-weight: 600; color: var(--text-dim); }
+  .alert.error .alert-kind { color: var(--err); }
+  .alert.warn .alert-kind { color: var(--warn); }
+  .alert-text { flex: 1 1 auto; word-break: break-word; }
+  .alert-detail { flex: 0 0 auto; }
+  .alert-detail summary { cursor: pointer; color: var(--muted); }
+  .alert-detail pre {
+    margin: 6px 0 0; max-width: 720px; max-height: 160px; overflow: auto;
+    font-family: var(--mono); font-size: 11.5px; color: var(--text-dim);
+    background: var(--bg-soft); border: 1px solid var(--line-soft); border-radius: 6px;
+    padding: 6px 8px; white-space: pre-wrap;
+  }
+  .alert-close {
+    flex: 0 0 auto; background: none; border: none; color: var(--muted);
+    cursor: pointer; font-size: 16px; line-height: 1; padding: 0 2px;
+  }
+  .alert-close:hover { color: var(--text); }
+
+  /* ---------------- 三栏骨架 ---------------- */
+  .layout {
+    flex: 1 1 auto; min-height: 0;
+    display: grid;
+    grid-template-columns: var(--col-left) minmax(0, 1fr) var(--col-right);
+    gap: 12px; padding: 12px 14px 14px;
+    transition: grid-template-columns .18s ease;
+  }
+  .layout.console-collapsed { grid-template-columns: var(--col-left) minmax(0, 1fr) var(--rail); }
+  .col { min-height: 0; display: flex; flex-direction: column; gap: 12px; overflow: auto; }
+  .col-center { overflow: hidden; }
+  .col-right { overflow: hidden; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 12px 13px; min-width: 0;
+  }
+  .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .card-head h2 { font-size: 13px; letter-spacing: .4px; color: var(--text-dim); }
+  .hint { color: var(--muted); font-size: 11.5px; line-height: 1.6; margin-top: 8px; }
+  .hint.err { color: var(--err); }
+
+  /* ---------------- 表单控件 ---------------- */
+  label.field { display: block; color: var(--muted); font-size: 12px; margin: 10px 0 5px; }
+  input[type=text], input[type=url], textarea, select {
+    width: 100%; background: var(--bg-soft); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 8px 10px; font-family: inherit; font-size: 13px;
+  }
+  textarea { resize: vertical; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
+  input:focus, textarea:focus, select:focus { border-color: var(--accent); outline: none; }
+  select:disabled, button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .btn {
+    cursor: pointer; border: 1px solid var(--line); border-radius: var(--radius-sm);
+    background: var(--panel-2); color: var(--text); padding: 8px 12px;
+    font-family: inherit; font-size: 13px; transition: .15s; white-space: nowrap;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--accent); background: #223052; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; flex: 1 1 auto; }
+  .btn.primary:hover:not(:disabled) { background: #4a7df0; }
+  .btn.ghost { background: transparent; }
+  .btn.tiny { padding: 4px 9px; font-size: 12px; }
+  .btn.loading { border-color: var(--accent); color: var(--accent-2); }
+  .check-row { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; font-size: 13px; }
+  .check-row input[type=checkbox] {
+    width: 15px; height: 15px; margin: 2px 0 0; flex: 0 0 auto;
+    accent-color: var(--accent); cursor: pointer;
+  }
+  .check-row label { cursor: pointer; color: var(--text-dim); }
+
+  /* Tab：图片源与对比模式共用同一套外观 */
+  .tabs { display: flex; gap: 4px; background: var(--bg-soft); padding: 4px; border: 1px solid var(--line); border-radius: 9px; }
+  .tab {
+    flex: 1 1 auto; border: none; background: transparent; color: var(--muted);
+    padding: 6px 8px; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 12.5px;
+    white-space: nowrap;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--accent); color: #fff; font-weight: 600; }
+
+  /* 拖拽区 */
+  .dropzone {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    padding: 18px 12px; margin-top: 10px; text-align: center; cursor: pointer;
+    border: 1px dashed var(--line); border-radius: var(--radius-sm);
+    background: var(--bg-soft); color: var(--muted); font-size: 12px;
+  }
+  .dropzone strong { color: var(--text-dim); font-size: 13px; }
+  .dropzone.dragover { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+
+  /* 内置测试图目录 */
+  .sample-list { margin-top: 8px; max-height: 320px; overflow: auto; padding-right: 2px; }
+  .sample-group + .sample-group { margin-top: 10px; }
+  .sample-group-title { font-size: 11.5px; color: var(--text-dim); font-weight: 600; margin-bottom: 5px; }
+  .sample-item {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    background: var(--bg-soft); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+    padding: 6px 8px; margin-bottom: 5px; color: var(--text); font-family: inherit; font-size: 12.5px;
+  }
+  .sample-item:hover { border-color: var(--accent); background: #16203a; }
+  .sample-item.loading { border-color: var(--accent); }
+  .sample-item-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .sample-item-title { font-weight: 600; }
+  .tag-size, .tag-gt {
+    font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .tag-gt { border-color: rgba(61, 220, 151, .45); color: var(--ok); }
+  .sample-item-purpose { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; line-height: 1.5; }
+
+  .image-info {
+    margin-top: 10px; padding: 7px 9px; border-radius: var(--radius-sm);
+    background: var(--bg-soft); border: 1px solid var(--line-soft);
+    color: var(--text-dim); font-size: 12px; word-break: break-word;
+  }
+  .status-line { margin-top: 10px; min-height: 18px; font-size: 12px; color: var(--muted); }
+  .status-line.busy { color: var(--accent-2); }
+  .status-line.ok { color: var(--ok); }
+  .status-line.warn { color: var(--warn); }
+  .status-line.err { color: var(--err); }
+  .spinner {
+    width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent);
+    border-radius: 50%; display: inline-block; animation: spin .7s linear infinite;
+    vertical-align: -1px; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------------- 对比查看区（主角） ---------------- */
+  .card-viewer { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+  .viewer-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .tabs-mode { flex: 0 0 auto; }
+  .tabs-mode .tab { min-width: 62px; }
+  .opacity-ctl { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+  .opacity-ctl input[type=range] { width: 130px; accent-color: var(--accent); }
+  .viewer-meta { margin-left: auto; color: var(--muted); font-size: 12px; text-align: right; }
+
+  /* .cmp 用 box-shadow 代替 border：绝对定位子元素相对 padding box 定位，
+     有边框就得在 JS 里减 clientLeft/clientTop，少一个出错来源。 */
+  .cmp {
+    position: relative; flex: 1 1 auto; min-height: 300px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      linear-gradient(45deg, rgba(255,255,255,.02) 25%, transparent 25%, transparent 75%, rgba(255,255,255,.02) 75%) 0 0 / 22px 22px,
+      var(--bg-soft);
+    box-shadow: inset 0 0 0 1px var(--line);
+    border-radius: var(--radius-sm);
+  }
+  .placeholder {
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    color: var(--muted); font-size: 13px; text-align: center; padding: 24px;
+  }
+  .placeholder strong { color: var(--text-dim); font-size: 14px; }
+
+  .cmp-side {
+    align-self: stretch; width: 100%; height: 100%;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px;
+  }
+  .pane {
+    position: relative; margin: 0; min-height: 0; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .pane img { max-width: 100%; max-height: 100%; display: block; }
+  /* 还没有标注图时右格是空的：给一句占位说明，避免看起来像渲染坏了。
+     用伪元素而不是额外元素，是为了不引入"永远取不到"的 id。 */
+  .cmp-side.no-anno .pane:last-child::after {
+    content: "尚未生成标注图"; color: var(--muted); font-size: 12px;
+  }
+  .pane-tag {
+    position: absolute; top: 0; left: 0; z-index: 3;
+    background: rgba(10, 15, 25, .82); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 8px; font-size: 11px; color: var(--muted);
+  }
+  /* 原图是流内元素，被 max-width/max-height 收缩到"恰好容纳"的尺寸；
+     syncFrame() 再量它的 getBoundingClientRect()，把标注层精确盖上去。 */
+  .cmp-ref { max-width: 100%; max-height: 100%; display: block; }
+  .cmp-overlay { position: absolute; overflow: hidden; }
+  .stack-tag {
+    position: absolute; top: 6px; z-index: 6; pointer-events: none;
+    background: rgba(10, 15, 25, .82); border: 1px solid var(--line);
+    border-radius: 6px; padding: 2px 8px; font-size: 11px; color: var(--muted);
+  }
+  .stack-tag.tag-left { left: 6px; }
+  .stack-tag.tag-right { right: 6px; }
+  /* 叠加模式下两张图叠在一起，左右标签会误导，直接隐藏 */
+  .cmp.overlay-mode .stack-tag { display: none; }
+  .cmp-overlay img { width: 100%; height: 100%; display: block; }
+  .slider-line {
+    position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+    background: var(--accent); z-index: 4; pointer-events: none;
+  }
+  .slider-handle {
+    position: absolute; top: 50%; width: 34px; height: 34px; margin: -17px 0 0 -17px;
+    border-radius: 50%; background: var(--accent); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; cursor: ew-resize; z-index: 5;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .55);
+  }
+  /* 叠加模式：同一个 stack，只是藏掉分隔线并给标注图加透明度 */
+  .cmp.overlay-mode .slider-line,
+  .cmp.overlay-mode .slider-handle { display: none; }
+
+  /* 结果指标条 */
+  .resultbar { flex: 0 0 auto; display: flex; flex-direction: column; gap: 8px; }
+  .metrics { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; color: var(--muted); font-size: 12px; }
+  .metric {
+    display: flex; align-items: baseline; gap: 6px; padding: 5px 10px;
+    background: var(--bg-soft); border: 1px solid var(--line-soft); border-radius: 999px;
+  }
+  .metric-k { color: var(--muted); font-size: 11.5px; }
+  .metric-v { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .metric-v.ok { color: var(--ok); }
+  .metric-v.warn { color: var(--warn); }
+  .metric-v.bad { color: var(--err); }
+  .detail {
+    border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--bg-soft);
+    padding: 6px 10px;
+  }
+  .detail > summary { cursor: pointer; color: var(--text-dim); font-size: 12.5px; }
+  .detail-body { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; max-height: 34vh; overflow: auto; }
+  .coord-space { font-size: 12px; padding: 6px 9px; border-radius: 7px; border: 1px solid var(--line); color: var(--muted); }
+  .coord-space.ok { border-color: rgba(61, 220, 151, .4); color: var(--ok); background: rgba(12, 40, 30, .5); }
+  .coord-space.warn { border-color: rgba(247, 185, 85, .45); color: var(--warn); background: rgba(58, 44, 16, .5); }
+  .per-target, .item-list { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+  .per-target li, .item-list li {
+    display: flex; justify-content: space-between; gap: 10px;
+    padding: 4px 2px; border-bottom: 1px dashed var(--line-soft);
+  }
+  .per-target li:last-child, .item-list li:last-child { border-bottom: none; }
+  .miss { color: var(--err); }
+  .coord { color: var(--muted); font-family: var(--mono); font-size: 11.5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 6px; vertical-align: 0; }
+
+  /* ---------------- 控制台（配角） ---------------- */
+  .card-console { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+  .console-head { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap; }
+  .console-title { min-width: 0; flex: 1 1 120px; }
+  .console-title h2 { font-size: 13px; color: var(--text-dim); }
+  .console-latest {
+    display: block; margin-top: 3px; font-size: 11.5px; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .console-head-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+  /* 竖条只在折叠时出现：默认 display:none，由 .layout.console-collapsed 打开 */
+  .console-rail {
+    display: none; flex-direction: column; align-items: center; gap: 10px; padding: 6px 0; color: var(--muted);
+  }
+  .rail-text { writing-mode: vertical-rl; letter-spacing: 3px; font-size: 12px; }
+  .rail-count {
+    font-size: 11px; padding: 1px 6px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--text-dim); font-variant-numeric: tabular-nums;
+  }
+  .layout.console-collapsed .console-title { display: none; }
+  .layout.console-collapsed #btnClearOutput { display: none; }
+  .layout.console-collapsed .console-rail { display: flex; }
+  .layout.console-collapsed .console-body { display: none; }
+  .console-body { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+  .stream { border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--bg-soft); }
+  .stream-head {
+    width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    background: none; border: none; cursor: pointer; padding: 6px 9px;
+    color: var(--text-dim); font-family: inherit; font-size: 12.5px; font-weight: 600;
+  }
+  .stream-head:hover { color: var(--text); }
+  .stream-head[aria-expanded="false"]::before { content: "▸ "; color: var(--muted); }
+  .stream-head[aria-expanded="true"]::before { content: "▾ "; color: var(--muted); }
+  .stream-count { font-weight: 400; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .stream-body {
+    max-height: 210px; overflow: auto; margin: 0; padding: 2px 9px 8px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word; color: var(--text-dim);
+  }
+  .stream-body.reasoning { color: #9fb0d0; }
+  .stream-body.content { color: #dbe5f8; }
+  .stream-body.tools { font-family: var(--sans); font-size: 12px; }
+  .tool-item {
+    border-left: 3px solid var(--ok); background: #101a2c; border-radius: 0 6px 6px 0;
+    padding: 6px 9px; margin: 6px 0; white-space: pre-wrap; word-break: break-word;
+  }
+  .tool-item.fail { border-left-color: var(--err); }
+  .tool-item .tname { color: var(--ok); font-weight: 600; }
+  .tool-item.fail .tname { color: var(--err); }
+  .tool-item .targs { color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  .stream-stats { color: var(--muted); font-size: 11.5px; padding: 2px; font-variant-numeric: tabular-nums; }
+
+  /* ---------------- 窄屏退化：单列 + 查看区优先 ---------------- */
+  @media (max-width: 1100px) {
+    body { height: auto; }
+    .layout {
+      grid-template-columns: minmax(0, 1fr) !important;
+      height: auto; padding: 10px;
+    }
+    .col { overflow: visible; }
+    .col-center { order: 2; overflow: visible; }
+    .col-left { order: 1; }
+    .col-right { order: 3; }
+    .cmp { flex: 0 0 auto; height: 58vh; min-height: 260px; }
+    .console-body { max-height: 52vh; overflow: auto; }
+    /* 单列里没有"竖条"这回事：折叠就只是收起正文，标题行（含最新信息）始终可见 */
+    .layout.console-collapsed .console-title { display: block; }
+    .layout.console-collapsed .console-rail { display: none; }
+    .sample-list { max-height: 260px; }
+  }
+  @media (max-width: 620px) {
+    .cmp-side { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+    .viewer-meta { width: 100%; margin-left: 0; text-align: left; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <h1>DeepSeek 物体定位 · 打标对比演示台</h1>
+    <p class="brand-sub">流式输出 · 工具执行 · 打标前后对比 · 真值自动打分</p>
+  </div>
+  <div class="topbar-badges">
+    <span class="badge" id="providerBadge" title="模型服务状态">检测中…</span>
+    <span class="badge" id="toolsBadge" title="后端已注册的工具">工具 —</span>
+  </div>
+</header>
+
+<!-- 错误与告警的唯一去处：进入 DOM 就不会被流式日志冲走 -->
+<div class="alertbar" id="alertBar" role="status" aria-live="polite" hidden></div>
+
+<main class="layout" id="layout">
+
+  <!-- ======================= 左栏：控制 ======================= -->
+  <section class="col col-left" aria-label="控制面板">
+
+    <!-- ① 图片源：上传 / URL / 内置测试图，同一件事的三个入口合并到一张卡 -->
+    <div class="card">
+      <div class="card-head"><h2>① 选择图片</h2></div>
+      <div class="tabs" id="sourceTabs" role="tablist" aria-label="图片来源">
+        <button class="tab" type="button" id="tabFile" role="tab" data-source="file" aria-selected="true" aria-controls="panelFile">本地上传</button>
+        <button class="tab" type="button" id="tabUrl" role="tab" data-source="url" aria-selected="false" aria-controls="panelUrl" tabindex="-1">图片 URL</button>
+        <button class="tab" type="button" id="tabSample" role="tab" data-source="sample" aria-selected="false" aria-controls="panelSample" tabindex="-1">内置测试图</button>
+      </div>
+
+      <div id="panelFile" role="tabpanel" aria-labelledby="tabFile">
+        <div class="dropzone" id="dropZone" role="button" tabindex="0"
+             aria-label="拖拽图片到此处，或按回车键选择本地文件">
+          <strong>拖拽图片到这里</strong>
+          <span>或按回车 / 点击选择文件（PNG · JPG · WEBP · BMP · GIF）</span>
+        </div>
+        <input type="file" id="fileInput" accept="image/*" hidden />
+        <div class="row">
+          <button class="btn" type="button" id="btnPickFile">选择本地文件…</button>
+          <button class="btn ghost" type="button" id="btnDemoImage" title="后端现场生成一张带 3 个已知目标的图">离线示例图</button>
+        </div>
+        <p class="hint">离线示例图由后端直接生成（不调模型），适合零配置先验证对比页面与手动标注。</p>
+      </div>
+
+      <div id="panelUrl" role="tabpanel" aria-labelledby="tabUrl" hidden>
+        <label class="field" for="urlInput">图片 URL</label>
+        <input type="url" id="urlInput" placeholder="https://example.com/photo.jpg" />
+        <div class="row">
+          <button class="btn" type="button" id="btnLoadUrl">载入该 URL</button>
+        </div>
+        <p class="hint">后端会先把图片下载到 runs/uploads/ 再送模型，避免推理时外链不可达。</p>
+      </div>
+
+      <div id="panelSample" role="tabpanel" aria-labelledby="tabSample" hidden>
+        <p class="hint" id="sampleMeta">目录加载中…</p>
+        <div class="sample-list" id="sampleGroups"></div>
+        <p class="hint">点任意一张即载入，并自动填入它对应的建议提示词；带「真值」标记的图在识别后由程序自动算检出率 / 平均 IoU / 标签准确率（判定口径见 @doc AGENTS.md#7-打标准确率评测结论）。</p>
+      </div>
+
+      <p class="image-info" id="imageInfo">尚未选择图片。</p>
+    </div>
+
+    <!-- ② 识别参数 -->
+    <div class="card">
+      <div class="card-head"><h2>② 识别参数</h2></div>
+      <label class="field" for="prompt">提示词</label>
+      <textarea id="prompt" rows="4" placeholder="例如：识别图中所有人物与车辆，输出中文名称">识别图中的主要目标，输出 bbox_2d 坐标与中文名称。</textarea>
+
+      <div class="check-row">
+        <input type="checkbox" id="useTools" checked />
+        <label for="useTools">工具执行框架（模型请求工具时由后端真正执行）</label>
+      </div>
+      <div class="check-row">
+        <input type="checkbox" id="thinking" checked />
+        <label for="thinking">思考模式（先流式输出思维链，再给正文）</label>
+      </div>
+
+      <label class="field" for="reasoningEffort">思考强度 reasoning_effort</label>
+      <select id="reasoningEffort">
+        <option value="">服务端默认（high）</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="xhigh">xhigh</option>
+        <option value="max">max</option>
+      </select>
+      <p class="hint" id="thinkingHint"></p>
+
+      <div class="row">
+        <button class="btn primary" type="button" id="btnDetect" data-role="redetect">▶ 开始识别</button>
+        <button class="btn" type="button" id="btnCancel" disabled>■ 取消</button>
+      </div>
+      <p class="status-line" id="statusLine" role="status" aria-live="polite">就绪。</p>
+    </div>
+
+    <!-- ③ 手动标注：与模型链路无关，离线也能用 -->
+    <div class="card">
+      <div class="card-head"><h2>③ 手动标注（离线）</h2></div>
+      <label class="field" for="manualJson">坐标 JSON（0.0~1.0 相对比例）</label>
+      <textarea id="manualJson" rows="7" spellcheck="false">[
+  {"bbox_2d": [0.18, 0.24, 0.43, 0.62], "label": "目标 A"},
+  {"point_2d": [0.64, 0.20], "label": "点位"}
+]</textarea>
+      <div class="row">
+        <button class="btn" type="button" id="btnManualApply" disabled>应用标注</button>
+        <button class="btn ghost" type="button" id="btnFillGt" disabled>填入真值</button>
+        <button class="btn ghost" type="button" id="btnClearAnno" disabled>清除标注</button>
+      </div>
+      <p class="hint">不调模型：直接把坐标画到当前图片上，用于离线验证对比查看与真值打分。</p>
+    </div>
+  </section>
+
+  <!-- ======================= 中栏：对比查看区（主角） ======================= -->
+  <section class="col col-center" aria-label="打标前后对比查看区">
+    <div class="card card-viewer">
+      <div class="viewer-head">
+        <div class="tabs tabs-mode" id="modeTabs" role="tablist" aria-label="对比模式">
+          <button class="tab active" type="button" id="tabModeSide" role="tab" data-mode="side" aria-selected="true">并排</button>
+          <button class="tab" type="button" id="tabModeSlider" role="tab" data-mode="slider" aria-selected="false" tabindex="-1">滑块</button>
+          <button class="tab" type="button" id="tabModeOverlay" role="tab" data-mode="overlay" aria-selected="false" tabindex="-1">叠加</button>
+        </div>
+        <label class="opacity-ctl" id="opacityCtl" for="opacity" hidden>
+          标注图不透明度
+          <input type="range" id="opacity" min="0" max="100" step="1" value="65" aria-label="标注图不透明度" />
+          <span id="opacityVal">65%</span>
+        </label>
+        <span class="viewer-meta" id="viewerMeta">打标前 / 打标后</span>
+      </div>
+
+      <div class="cmp" id="cmpStage">
+        <div class="placeholder" id="stageEmpty">
+          <strong>还没有图片</strong>
+          <span>从左侧任选一种来源载入：本地上传 / 图片 URL / 内置测试图</span>
+        </div>
+
+        <div class="cmp-side" id="modeSide" hidden>
+          <figure class="pane">
+            <figcaption class="pane-tag">打标前 · 原图</figcaption>
+            <img id="sideBefore" alt="打标前的原图" />
+          </figure>
+          <figure class="pane">
+            <figcaption class="pane-tag">打标后 · 标注图</figcaption>
+            <img id="sideAfter" alt="打标后的标注图" />
+          </figure>
+        </div>
+
+        <img class="cmp-ref" id="stackBefore" alt="打标前的原图" hidden />
+        <div class="cmp-overlay" id="stackOverlay" hidden>
+          <img id="stackAfter" alt="打标后的标注图" />
+          <!-- 三种模式的左右顺序必须一致：原图在左、标注图在右。
+               并排模式天然如此；滑块/叠加公用同一个 stack，靠 clip-path 切标注层，
+               因此分割线左边露出的是底层的原图、右边才是标注图（见 applySplit）。
+               叠加模式下两图重合，标签无意义故隐藏。 -->
+          <span class="stack-tag tag-left" aria-hidden="true">◀ 打标前 · 原图</span>
+          <span class="stack-tag tag-right" aria-hidden="true">打标后 · 标注图 ▶</span>
+          <div class="slider-line" id="sliderLine" aria-hidden="true"></div>
+          <div class="slider-handle" id="sliderHandle" role="slider" tabindex="0"
+               aria-label="对比分隔线位置" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"
+               aria-orientation="horizontal" title="拖动或用左右方向键调整">⇆</div>
+        </div>
+      </div>
+
+      <div class="resultbar">
+        <div class="metrics" id="metricsBox" aria-live="polite">尚未识别。</div>
+        <details class="detail" id="detailBox">
+          <summary>逐目标明细 · 坐标空间诊断 · 识别到的目标</summary>
+          <div class="detail-body">
+            <div class="coord-space" id="coordSpace">载入带真值的内置测试图并完成识别后，这里给出 coord_space 诊断。</div>
+            <ul class="per-target" id="perTarget"></ul>
+            <ul class="item-list" id="resultList"></ul>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= 右栏：流式控制台（配角，可折叠） ======================= -->
+  <section class="col col-right" aria-label="流式输出控制台">
+    <div class="card card-console">
+      <div class="console-head">
+        <div class="console-title">
+          <h2>流式控制台</h2>
+          <span class="console-latest" id="consoleLatest">（尚未开始）</span>
+        </div>
+        <div class="console-head-actions">
+          <button class="btn tiny ghost" type="button" id="btnClearOutput">清空</button>
+          <button class="btn tiny" type="button" id="btnToggleConsole" aria-expanded="true"
+                  aria-controls="consoleBody" title="折叠控制台，把宽度让给对比区">折叠</button>
+        </div>
+      </div>
+      <div class="console-rail" id="consoleRail" hidden>
+        <span class="rail-text">控制台</span>
+        <span class="rail-count" id="railCount">0</span>
+      </div>
+      <div class="console-body" id="consoleBody">
+        <section class="stream">
+          <button class="stream-head" type="button" id="btnToggleReasoning" aria-expanded="true" aria-controls="logReasoning">
+            <span>思考过程</span><span class="stream-count" id="reasoningCount">0 字</span>
+          </button>
+          <pre class="stream-body reasoning" id="logReasoning">（思考模式开启时，模型的思维链会实时显示在这里）</pre>
+        </section>
+        <section class="stream">
+          <button class="stream-head" type="button" id="btnToggleContent" aria-expanded="true" aria-controls="logContent">
+            <span>正文回答</span><span class="stream-count" id="contentCount">0 字</span>
+          </button>
+          <pre class="stream-body content" id="logContent">（模型正文会实时显示在这里）</pre>
+        </section>
+        <section class="stream">
+          <button class="stream-head" type="button" id="btnToggleTools" aria-expanded="true" aria-controls="logTools">
+            <span>工具调用与结果</span><span class="stream-count" id="toolCount">0 次</span>
+          </button>
+          <div class="stream-body tools" id="logTools">（模型请求工具后，这里显示调用参数与执行结果）</div>
+        </section>
+        <div class="stream-stats" id="eventStats">事件 0 · 轮次 0</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<noscript><p style="padding:16px">本页面需要启用 JavaScript 才能使用流式识别与对比查看。</p></noscript>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ======================================================================
+   * 0. 常量
+   * ==================================================================== */
+  const STORE = { thinking: "objloc.thinking", effort: "objloc.effort", mode: "objloc.compareMode" };
+  // 用"字面量 id"登记一切需要按状态显隐的元素：渲染函数里只按名字取，不散落字符串
+  const SOURCE_PANELS = { file: "panelFile", url: "panelUrl", sample: "panelSample" };
+  const SOURCE_TABS = { file: "tabFile", url: "tabUrl", sample: "tabSample" };
+  const MODE_TABS = { side: "tabModeSide", slider: "tabModeSlider", overlay: "tabModeOverlay" };
+  const ALERT_LABEL = { error: "错误", warn: "告警", info: "提示", ok: "完成" };
+  const ALERT_LIMIT = 5;                 // 告警条最多同时显示几条，超出丢最旧的
+  const PLACEHOLDER = {
+    reasoning: "（思考模式开启时，模型的思维链会实时显示在这里）",
+    content: "（模型正文会实时显示在这里）",
+    tools: "（模型请求工具后，这里显示调用参数与执行结果）",
+  };
+  const ITEM_COLORS = ["#5b8cff", "#3ddc97", "#f7b955", "#ff7a7a", "#a855f7", "#22d3ee", "#f472b6", "#a3e635"];
+  // 指标配色阈值 [优, 及格]：让"这次到底好不好"一眼可读，不用逐位比数字
+  const METRIC_LEVELS = {
+    detection_rate: [0.9, 0.6], mean_iou: [0.85, 0.6], label_accuracy: [0.9, 0.6], precision: [0.9, 0.6],
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  /* ======================================================================
+   * 1. 状态模型：唯一可变真相，界面是它的投影（见文件头「二、状态模型」）
+   * ==================================================================== */
+  const state = {
+    health: null,
+    source: "sample",                                     // 当前展开的图片源 Tab
+    image: { id: null, url: null, width: 0, height: 0, filename: "", sampleId: null, sample: null, groundTruth: null },
+    run: { token: 0, active: false, controller: null, started: 0, rounds: 0, finished: false, gotAnnotated: false, failed: false },
+    result: { annotatedUrl: null, items: null, summary: null, accuracy: null },
+    stream: { latest: "", reasoningChars: 0, contentChars: 0, toolCalls: 0, events: 0 },
+    view: { mode: "side", split: 50, opacity: 0.65, thinking: true, effort: "", consoleCollapsed: false, thinkingTouched: false },
+    alerts: [],
+    samples: [],
+  };
+
+  /* ======================================================================
+   * 2. 通用小工具
+   * ==================================================================== */
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const fmtPct = (v) => (typeof v === "number" ? (v * 100).toFixed(0) + "%" : "—");
+  const fmtNum = (v, digits) => (typeof v === "number" ? v.toFixed(digits == null ? 3 : digits) : "—");
+
+  // 所有拼进 innerHTML 的外部文本（模型输出、后端 detail、图片 URL）都必须过这一层
+  function escapeHtml(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+    ));
+  }
+  function truncate(value, limit) {
+    const s = String(value == null ? "" : value);
+    return s.length > limit ? s.slice(0, limit) + "…" : s;
+  }
+  function readStore(key) {
+    try { return window.localStorage.getItem(key); } catch (e) { return null; }   // 隐私模式会抛异常
+  }
+  function writeStore(key, value) {
+    try { window.localStorage.setItem(key, value); } catch (e) { /* 忽略：记忆失败不影响功能 */ }
+  }
+  function levelOf(name, value) {
+    const t = METRIC_LEVELS[name];
+    if (!t || typeof value !== "number") return "";
+    return value >= t[0] ? "ok" : (value >= t[1] ? "warn" : "bad");
+  }
+  function errText(resp) {
+    return resp.status + " " + resp.statusText;
+  }
+  async function readError(resp) {
+    try {
+      const data = await resp.json();
+      return data && data.detail ? String(data.detail) : JSON.stringify(data);
+    } catch (e) { return errText(resp); }
+  }
+
+  /* ======================================================================
+   * 3. 顶部告警条 + 左栏状态行：错误/告警与"当前在做什么"分开
+   * ==================================================================== */
+  function pushAlert(kind, text, detail) {
+    const msg = String(text == null ? "" : text).trim();
+    if (!msg) return;
+    // 相邻的完全相同提示直接吞掉：SSE 的 warning 有时会连着发同样内容
+    const last = state.alerts[state.alerts.length - 1];
+    if (last && last.kind === kind && last.text === msg) return;
+    state.alerts.push({ kind: kind, text: msg, detail: detail || "" });
+    while (state.alerts.length > ALERT_LIMIT) state.alerts.shift();
+    renderAlerts();
+  }
+  function dismissAlert(index) {
+    state.alerts.splice(index, 1);
+    renderAlerts();
+  }
+  function clearAlerts() {
+    state.alerts = [];
+    renderAlerts();
+  }
+  function renderAlerts() {
+    const bar = $("alertBar");
+    if (!state.alerts.length) { bar.hidden = true; bar.textContent = ""; return; }
+    bar.hidden = false;
+    bar.innerHTML = state.alerts.map((a, i) =>
+      '<div class="alert ' + a.kind + '">' +
+        '<span class="alert-kind">' + (ALERT_LABEL[a.kind] || "提示") + "</span>" +
+        '<span class="alert-text">' + escapeHtml(a.text) + "</span>" +
+        (a.detail ? '<details class="alert-detail"><summary>详情</summary><pre>' + escapeHtml(a.detail) + "</pre></details>" : "") +
+        '<button class="alert-close" type="button" data-alert-index="' + i + '" aria-label="关闭这条提示">×</button>' +
+      "</div>").join("");
+  }
+  function setStatus(text, kind) {
+    const el = $("statusLine");
+    el.className = "status-line" + (kind ? " " + kind : "");
+    el.textContent = text || "";
+    if (kind === "busy") {
+      const spinner = document.createElement("span");
+      spinner.className = "spinner";
+      spinner.setAttribute("aria-hidden", "true");
+      el.prepend(spinner);
+    }
+  }
+
+  /* ======================================================================
+   * 4. 渲染：图片源 Tab 与内置测试图目录
+   * ==================================================================== */
+  function setSource(name) {
+    state.source = name;
+    Object.keys(SOURCE_PANELS).forEach((key) => {
+      $(SOURCE_PANELS[key]).hidden = key !== name;
+      const tab = $(SOURCE_TABS[key]);
+      const on = key === name;
+      tab.classList.toggle("active", on);
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+      tab.tabIndex = on ? 0 : -1;       // 漫游 tabindex：Tab 键只落在当前选中的那个
+    });
+  }
+  function renderSampleCatalog(data) {
+    const box = $("sampleGroups");
+    const groups = data.groups || [];
+    $("sampleMeta").textContent = "共 " + data.total + " 张，分 " + groups.length + " 组；点击任意一张即载入。";
+    box.innerHTML = groups.map((g) =>
+      '<div class="sample-group" role="group" aria-label="' + escapeHtml(g.group) + '">' +
+        '<div class="sample-group-title">' + escapeHtml(g.group) + "</div>" +
+        g.items.map((it) =>
+          '<button class="sample-item" type="button" data-sample-id="' + escapeHtml(it.id) + '"' +
+          ' aria-label="载入测试图 ' + escapeHtml(it.title) + '">' +
+            '<span class="sample-item-head">' +
+              '<span class="sample-item-title">' + escapeHtml(it.title) + "</span>" +
+              '<span class="tag-size">' + it.width + "×" + it.height + "</span>" +
+              (it.evaluable ? '<span class="tag-gt">真值</span>' : "") +
+            "</span>" +
+            '<span class="sample-item-purpose">' + escapeHtml(it.purpose) + "</span>" +
+          "</button>").join("") +
+      "</div>").join("");
+  }
+  async function loadSampleCatalog() {
+    try {
+      const resp = await fetch("/api/samples");
+      if (!resp.ok) throw new Error(await readError(resp));
+      const data = await resp.json();
+      state.samples = data.groups || [];
+      renderSampleCatalog(data);
+    } catch (e) {
+      $("sampleMeta").textContent = "测试图目录加载失败。";
+      $("sampleGroups").innerHTML = '<p class="hint err">' + escapeHtml(e.message) + "</p>";
+      pushAlert("error", "内置测试图目录加载失败：" + e.message);
+    }
+  }
+
+  /* ======================================================================
+   * 5. 渲染：当前图片 + 识别控件可用性
+   * ==================================================================== */
+  function imageTagText() {
+    const s = state.image.sample;
+    return s ? " · 测试图「" + s.title + "」" : "";
+  }
+  function renderImage() {
+    const img = state.image;
+    $("imageInfo").textContent = img.id
+      ? "已选择：" + (img.filename || img.id) + " · " + img.width + "×" + img.height + imageTagText()
+      : "尚未选择图片。";
+    $("stageEmpty").hidden = !!img.url;
+  }
+  function renderControls() {
+    const hasImage = !!state.image.id;
+    const running = state.run.active;
+    const btn = $("btnDetect");
+    btn.disabled = !hasImage || running;
+    btn.textContent = running ? "识别中…" : (state.run.finished ? "↻ 重新识别" : "▶ 开始识别");
+    btn.setAttribute("aria-label", state.run.finished ? "重新识别当前图片" : "开始识别当前图片");
+    $("btnCancel").disabled = !running;
+    $("btnManualApply").disabled = !hasImage;
+    $("btnClearAnno").disabled = !state.result.annotatedUrl;
+    $("btnFillGt").disabled = !(state.image.groundTruth && state.image.groundTruth.length);
+    $("reasoningEffort").disabled = !state.view.thinking;
+  }
+
+  /* ======================================================================
+   * 6. 渲染：对比查看区（三模式 + 严格对齐的滑块）
+   * ==================================================================== */
+  let frameRaf = 0;
+  function scheduleSyncFrame() {
+    if (frameRaf) return;
+    frameRaf = window.requestAnimationFrame(() => { frameRaf = 0; syncFrame(); });
+  }
+  // 把标注层精确盖到"原图实际显示矩形"上。
+  // 原图由浏览器按 max-width/max-height 收缩（等价于 contain，且元素自身没有留白），
+  // 因此量它的 rect 就得到了图片内容矩形——clip-path 的百分比天然等于图片的百分比。
+  function syncFrame() {
+    const stage = $("cmpStage");
+    const before = $("stackBefore");
+    const overlay = $("stackOverlay");
+    if (!stage || !before || !overlay || before.hidden || overlay.hidden) return;
+    const sr = stage.getBoundingClientRect();
+    const br = before.getBoundingClientRect();
+    if (!br.width || !br.height) return;
+    overlay.style.left = (br.left - sr.left) + "px";
+    overlay.style.top = (br.top - sr.top) + "px";
+    overlay.style.width = br.width + "px";
+    overlay.style.height = br.height + "px";
+  }
+  function applySplit() {
+    const pct = clamp(state.view.split, 0, 100);
+    // 从左侧切掉 pct%：分割线左边露出底层原图，右边是标注图，与并排模式同向
+    $("stackAfter").style.clipPath = "inset(0 0 0 " + pct + "%)";
+    $("sliderLine").style.left = pct + "%";
+    $("sliderHandle").style.left = pct + "%";
+    $("sliderHandle").setAttribute("aria-valuenow", String(Math.round(pct)));
+  }
+  function applyOpacity() {
+    $("stackAfter").style.opacity = String(state.view.opacity);
+    $("opacity").value = String(Math.round(state.view.opacity * 100));
+    $("opacityVal").textContent = Math.round(state.view.opacity * 100) + "%";
+  }
+  function setMode(mode, persist) {
+    state.view.mode = mode;
+    Object.keys(MODE_TABS).forEach((key) => {
+      const tab = $(MODE_TABS[key]);
+      const on = key === mode;
+      tab.classList.toggle("active", on);
+      tab.setAttribute("aria-selected", on ? "true" : "false");
+      tab.tabIndex = on ? 0 : -1;
+    });
+    if (persist) writeStore(STORE.mode, mode);
+    renderViewer();
+  }
+  function renderViewer() {
+    const hasImage = !!state.image.url;
+    const hasAnno = !!state.result.annotatedUrl;
+    // 滑块 / 叠加都需要标注图；没有就退回并排，避免出现"半张空的对比"
+    const fallback = !hasAnno && state.view.mode !== "side";
+    const mode = fallback ? "side" : state.view.mode;
+    const stacked = hasImage && mode !== "side";
+
+    $("modeSide").hidden = !(hasImage && mode === "side");
+    $("modeSide").classList.toggle("no-anno", !hasAnno);
+    $("stackBefore").hidden = !stacked;
+    $("stackOverlay").hidden = !(stacked && hasAnno);
+    $("cmpStage").classList.toggle("overlay-mode", mode === "overlay");
+    $("opacityCtl").hidden = !(stacked && hasAnno);
+
+    const summary = state.result.summary;
+    if (!hasImage) {
+      $("viewerMeta").textContent = "打标前 / 打标后";
+    } else if (fallback) {
+      $("viewerMeta").textContent = "尚无标注图，已回退到「并排」；发起识别或手动标注后可用滑块 / 叠加。";
+    } else if (summary) {
+      $("viewerMeta").textContent = "bbox " + summary.bbox_count + " · point " + summary.point_count + " · 共 " + summary.total;
+    } else {
+      $("viewerMeta").textContent = "打标前 / 打标后（等待标注结果）";
+    }
+    if (stacked) scheduleSyncFrame();
+  }
+
+  /* ======================================================================
+   * 7. 渲染：结果指标条 + 逐目标明细 + 坐标空间诊断
+   * ==================================================================== */
+  function metricChip(name, label, value, text) {
+    return '<span class="metric"><span class="metric-k">' + label + "</span>" +
+           '<span class="metric-v ' + levelOf(name, value) + '">' + text + "</span></span>";
+  }
+  function renderResult() {
+    const res = state.result;
+    const box = $("metricsBox");
+    if (!res.annotatedUrl) {
+      box.innerHTML = state.image.sampleId
+        ? "已载入带真值的测试图：发起识别或手动标注后，这里自动给出检出率 / 平均 IoU / 标签准确率。"
+        : "尚未识别。";
+      $("coordSpace").className = "coord-space";
+      $("coordSpace").textContent = "载入带真值的内置测试图并完成识别后，这里给出 coord_space 诊断。";
+      $("perTarget").innerHTML = "";
+      $("resultList").innerHTML = "";
+      return;
+    }
+
+    const acc = res.accuracy;
+    const items = res.items || [];
+    let html = "";
+    if (acc) {
+      html += metricChip("detection_rate", "检出率", acc.detection_rate, acc.hits + "/" + acc.gt_count + " · " + fmtPct(acc.detection_rate));
+      html += metricChip("mean_iou", "平均 IoU", acc.mean_iou, fmtNum(acc.mean_iou));
+      html += metricChip("label_accuracy", "标签准确率", acc.label_accuracy, fmtPct(acc.label_accuracy));
+      html += metricChip("precision", "查准率", acc.precision, fmtPct(acc.precision));
+    } else {
+      html += '<span class="metric"><span class="metric-k">识别结果</span><span class="metric-v">' +
+              items.length + " 个目标</span></span>";
+      html += '<span class="metric"><span class="metric-k">自动打分</span><span class="metric-v">不可用</span></span>' +
+              '<span class="hint">该图没有坐标真值（或不是内置测试图），改用人工对照。</span>';
+    }
+    box.innerHTML = html;
+
+    const space = $("coordSpace");
+    if (acc) {
+      const pixel = acc.coord_space === "pixel";
+      space.className = "coord-space " + (pixel ? "warn" : "ok");
+      space.innerHTML = pixel
+        ? "⚠ <strong>coord_space = pixel</strong>：模型本次输出的是像素坐标，未遵守 0.0~1.0 约定。" +
+          "按像素解释的上限成绩为 检出 " + fmtPct(acc.detection_rate_best) + "、平均 IoU " + fmtNum(acc.mean_iou_best) +
+          "；当前分数取自未换算的口径，说明坐标约定未被遵守（见 @doc AGENTS.md#4.3-坐标约定）。"
+        : "✓ <strong>coord_space = normalized</strong>：模型遵守了 0.0~1.0 相对坐标约定，本次分数即为真实成绩。";
+    } else {
+      space.className = "coord-space";
+      space.textContent = "无真值可比对，跳过坐标空间诊断。";
+    }
+
+    const rows = (acc && acc.per_target) || [];
+    $("perTarget").innerHTML = rows.map((t) =>
+      "<li><span>" + escapeHtml(t.gt_label) + " → " + escapeHtml(t.pred_label) +
+        (t.label_ok ? "" : ' <span class="miss">标签×</span>') + "</span>" +
+      '<span class="' + (t.hit ? "" : "miss") + '">IoU ' + fmtNum(t.iou) + (t.hit ? "" : " · 未命中") + "</span></li>").join("");
+
+    $("resultList").innerHTML = items.map((it, i) => {
+      const color = ITEM_COLORS[i % ITEM_COLORS.length];
+      const label = it.label || "(未命名)";
+      const coord = it.bbox_2d ? "bbox " + it.bbox_2d.join(", ")
+                  : (it.point_2d ? "point " + it.point_2d.join(", ") : "");
+      return '<li><span><span class="dot" style="background:' + color + '"></span>' + escapeHtml(label) + "</span>" +
+             '<span class="coord">' + escapeHtml(coord) + "</span></li>";
+    }).join("");
+  }
+
+  /* ======================================================================
+   * 8. 渲染：流式控制台（思考 / 正文 / 工具三段独立、各自可折叠）
+   * ==================================================================== */
+  let latestRaf = 0;
+  let pendingLatest = null;
+  // 逐 token 事件可能有 700+ 条，控制台"最新一行"用 rAF 合帧，
+  // 否则每条 token 都写一次 DOM，长输出时会明显掉帧。
+  function setLatest(text) {
+    pendingLatest = text;
+    if (latestRaf) return;
+    latestRaf = window.requestAnimationFrame(() => { latestRaf = 0; renderConsoleMeta(); });
+  }
+  function renderConsoleMeta() {
+    if (pendingLatest !== null) { state.stream.latest = pendingLatest; pendingLatest = null; }
+    $("consoleLatest").textContent = state.stream.latest || "（尚未开始）";
+    $("eventStats").textContent = "事件 " + state.stream.events + " · 轮次 " + state.run.rounds;
+    $("railCount").textContent = String(state.stream.events);
+    $("reasoningCount").textContent = state.stream.reasoningChars + " 字";
+    $("contentCount").textContent = state.stream.contentChars + " 字";
+    $("toolCount").textContent = state.stream.toolCalls + " 次";
+  }
+  function appendStream(kind, text) {
+    if (!text) return;
+    const el = kind === "reasoning" ? $("logReasoning") : $("logContent");
+    if (el.dataset.placeholder !== "0") { el.textContent = ""; el.dataset.placeholder = "0"; }
+    // 只有原本就贴着底部才自动滚动：否则用户往上翻历史会被逐条 token 强行拽回底部
+    const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    el.appendChild(document.createTextNode(text));
+    if (kind === "reasoning") state.stream.reasoningChars += text.length;
+    else state.stream.contentChars += text.length;
+    if (pinned) el.scrollTop = el.scrollHeight;
+  }
+  function toolBox() {
+    const box = $("logTools");
+    if (box.dataset.placeholder !== "0") { box.textContent = ""; box.dataset.placeholder = "0"; }
+    return box;
+  }
+  function addToolCall(name, args) {
+    const box = toolBox();
+    state.stream.toolCalls += 1;
+    const div = document.createElement("div");
+    div.className = "tool-item";
+    div.innerHTML = '<span class="tname">▶ ' + escapeHtml(name) + "</span>" +
+                    '<div class="targs">' + escapeHtml(truncate(args || "{}", 400)) + "</div>";
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+  function addToolResult(evt) {
+    const box = toolBox();
+    const div = document.createElement("div");
+    div.className = "tool-item" + (evt.ok ? "" : " fail");
+    div.innerHTML = '<span class="tname">' + (evt.ok ? "✔" : "✘") + " " + escapeHtml(evt.name) + "</span>" +
+                    ' <span class="targs">' + (evt.elapsed_ms == null ? "" : evt.elapsed_ms + " ms") + "</span>" +
+                    "<div>" + escapeHtml(truncate(evt.content, 1200)) + "</div>";
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+  function resetStream() {
+    state.stream.latest = "";
+    pendingLatest = null;
+    state.stream.reasoningChars = 0;
+    state.stream.contentChars = 0;
+    state.stream.toolCalls = 0;
+    state.stream.events = 0;
+    [["logReasoning", PLACEHOLDER.reasoning], ["logContent", PLACEHOLDER.content]].forEach((pair) => {
+      const el = $(pair[0]);
+      el.textContent = pair[1];
+      el.dataset.placeholder = "1";
+    });
+    const tools = $("logTools");
+    tools.textContent = PLACEHOLDER.tools;
+    tools.dataset.placeholder = "1";
+    renderConsoleMeta();
+  }
+  function setConsoleCollapsed(collapsed) {
+    state.view.consoleCollapsed = !!collapsed;
+    $("layout").classList.toggle("console-collapsed", state.view.consoleCollapsed);
+    const btn = $("btnToggleConsole");
+    btn.setAttribute("aria-expanded", String(!state.view.consoleCollapsed));
+    btn.textContent = state.view.consoleCollapsed ? "展开" : "折叠";
+    scheduleSyncFrame();      // 中栏变宽，覆盖层要重新贴合图片矩形
+  }
+  function setSectionCollapsed(btnId, bodyId, collapsed) {
+    $(btnId).setAttribute("aria-expanded", String(!collapsed));
+    $(bodyId).hidden = collapsed;
+  }
+  function toggleSection(btnId, bodyId) {
+    const expanded = $(btnId).getAttribute("aria-expanded") === "true";
+    setSectionCollapsed(btnId, bodyId, expanded);
+  }
+
+  /* ======================================================================
+   * 9. 图片载入（上传 / URL / 内置测试图 / 离线示例图）—— 四条路都汇到 applyImage
+   * ==================================================================== */
+  function clearAnnotated() {
+    state.result.annotatedUrl = null;
+    state.result.items = null;
+    state.result.summary = null;
+    state.result.accuracy = null;
+    ["sideAfter", "stackAfter"].forEach((id) => {
+      const el = $(id);
+      el.removeAttribute("src");   // 不要置空串：空 src 会让浏览器按当前页面地址再请求一次
+      el.hidden = true;
+    });
+    state.view.split = 50;
+    applySplit();
+  }
+  function applyImage(record) {
+    cancelRun();                     // 换图 = 作废在途识别，旧事件不会写到新图上
+    state.image = {
+      id: record.id,
+      url: record.url,
+      width: record.width,
+      height: record.height,
+      filename: record.filename || record.id,
+      sampleId: record.sample_id || (record.sample && record.sample.id) || null,
+      sample: record.sample || null,
+      groundTruth: record.ground_truth || null,
+    };
+    state.run.finished = false;
+    state.run.rounds = 0;
+    state.run.gotAnnotated = false;
+    clearAnnotated();
+    resetStream();
+    $("sideBefore").src = record.url;
+    $("stackBefore").src = record.url;
+    setStatus("图片已就绪（" + record.width + "×" + record.height + "），可以发起识别。", "ok");
+    renderAll();
+    scheduleSyncFrame();
+    if (state.image.sample && state.image.sample.evaluable) {
+      pushAlert("info", "已载入带真值的测试图「" + state.image.sample.title + "」，识别完成后由程序自动打分。");
+    }
+  }
+  async function uploadFile(file) {
+    if (!file) return;
+    const form = new FormData();
+    form.append("file", file);
+    setStatus("上传中…", "busy");
+    try {
+      const resp = await fetch("/api/upload", { method: "POST", body: form });
+      if (!resp.ok) throw new Error(await readError(resp));
+      applyImage(await resp.json());
+    } catch (e) {
+      setStatus("上传失败：" + e.message, "err");
+      pushAlert("error", "上传失败：" + e.message);
+    }
+  }
+  async function loadFromUrl() {
+    const url = $("urlInput").value.trim();
+    if (!url) { setStatus("请先填写图片 URL。", "err"); return; }
+    setStatus("下载图片中…", "busy");
+    try {
+      const resp = await fetch("/api/upload_url", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: url }),
+      });
+      if (!resp.ok) throw new Error(await readError(resp));
+      applyImage(await resp.json());
+    } catch (e) {
+      setStatus("载入失败：" + e.message, "err");
+      pushAlert("error", "按 URL 载入失败：" + e.message);
+    }
+  }
+  async function loadDemoImage() {
+    setStatus("生成离线示例图…", "busy");
+    try {
+      const resp = await fetch("/api/sample", { method: "POST" });
+      if (!resp.ok) throw new Error(await readError(resp));
+      const data = await resp.json();
+      applyImage(data.image);
+      $("manualJson").value = JSON.stringify(data.sample_items, null, 2);
+      setStatus("离线示例图已就绪（坐标已填进下方标注框）。", "ok");
+    } catch (e) {
+      setStatus("示例图加载失败：" + e.message, "err");
+      pushAlert("error", "离线示例图加载失败：" + e.message);
+    }
+  }
+  async function loadSampleImage(sampleId, btn) {
+    if (btn) btn.classList.add("loading");
+    setStatus("生成 / 载入测试图 " + sampleId + "…（大图首次生成需要一两秒）", "busy");
+    try {
+      const resp = await fetch("/api/samples/" + encodeURIComponent(sampleId) + "/load", { method: "POST" });
+      if (!resp.ok) throw new Error(await readError(resp));
+      const data = await resp.json();
+      applyImage(data);
+      if (data.prompt) $("prompt").value = data.prompt;
+      // 真值顺手填进手动标注框：离线也能画出标准答案做对照
+      const gt = (data.ground_truth || []).slice(0, 12);
+      if (gt.length) $("manualJson").value = JSON.stringify(gt, null, 2);
+      setStatus("已载入测试图：" + data.sample.title + "（" + data.width + "×" + data.height + "），建议提示词已填入。", "ok");
+    } catch (e) {
+      setStatus("载入测试图失败：" + e.message, "err");
+      pushAlert("error", "载入测试图失败：" + e.message);
+    } finally {
+      if (btn) btn.classList.remove("loading");
+    }
+  }
+  function fillGroundTruth() {
+    const gt = state.image.groundTruth;
+    if (!gt || !gt.length) { pushAlert("warn", "当前图片没有坐标真值（只有内置测试图才带真值）。"); return; }
+    $("manualJson").value = JSON.stringify(gt, null, 2);
+    if ($("detailBox")) $("detailBox").open = true;
+    setStatus("真值已填入标注框，点「应用标注」即可画出标准答案。", "ok");
+  }
+  function clearAnnotation() {
+    clearAnnotated();
+    renderResult();
+    renderViewer();
+    renderControls();
+    setStatus("已清除标注图与打分。", "");
+  }
+
+  /* ======================================================================
+   * 10. 结果落地 + 手动标注（离线）
+   * ==================================================================== */
+  function applyAnnotated(url, summary, items, accuracy) {
+    state.result.annotatedUrl = url;
+    state.result.summary = summary || null;
+    state.result.items = items || [];
+    state.result.accuracy = accuracy || null;
+    ["sideAfter", "stackAfter"].forEach((id) => {
+      const el = $(id);
+      el.hidden = false;
+      el.src = url;                 // url 自带 ?t=xxx，避免浏览器复用旧图缓存
+    });
+    renderResult();
+    renderViewer();
+    renderControls();
+    scheduleSyncFrame();
+  }
+  async function manualAnnotate() {
+    if (!state.image.id) { pushAlert("warn", "请先选择一张图片。"); return; }
+    let items;
+    try {
+      items = JSON.parse($("manualJson").value || "[]");
+    } catch (e) {
+      setStatus("坐标 JSON 解析失败。", "err");
+      pushAlert("error", "坐标 JSON 解析失败：" + e.message);
+      return;
+    }
+    if (!Array.isArray(items)) items = [items];
+    if (!items.length) { pushAlert("warn", "坐标 JSON 是空的，没有可绘制的目标。"); return; }
+    setStatus("绘制中…", "busy");
+    try {
+      const resp = await fetch("/api/annotate", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_id: state.image.id, items: items }),
+      });
+      if (!resp.ok) throw new Error(await readError(resp));
+      const data = await resp.json();
+      applyAnnotated(data.annotated_url, data.summary, data.items, data.accuracy);
+      const notes = [data.notice, data.warning].filter(Boolean);
+      notes.forEach((n) => pushAlert("warn", n));
+      setStatus(notes.length ? "标注完成（有告警，见顶部提示条）。" : "手动标注完成。", notes.length ? "warn" : "ok");
+    } catch (e) {
+      setStatus("标注失败：" + e.message, "err");
+      pushAlert("error", "手动标注失败：" + e.message);
+    }
+  }
+
+  /* ======================================================================
+   * 11. 流式识别：SSE 读取 + 过期事件丢弃（token 机制，见文件头「三、事件流」）
+   * ==================================================================== */
+  function cancelRun() {
+    state.run.token += 1;          // token 一变，所有在途事件立即失效
+    if (state.run.controller) {
+      try { state.run.controller.abort(); } catch (e) { /* 已结束，忽略 */ }
+      state.run.controller = null;
+    }
+    if (state.run.active) { state.run.active = false; renderControls(); }
+  }
+  function onCancelClick() {
+    if (!state.run.active) return;
+    cancelRun();
+    setStatus("已取消本次识别。", "warn");
+    pushAlert("info", "已取消正在进行的识别（后端会随连接断开停止推送）。");
+    renderControls();
+  }
+  function handleSseBlock(block, token) {
+    // SSE 规范允许一条事件携带多行 data:，按换行拼接后再解析（后端目前只发一行）
+    const payload = block.split("\n")
+      .filter((line) => line.indexOf("data:") === 0)
+      .map((line) => line.slice(5).trim())
+      .join("\n");
+    if (!payload) return;
+    if (token !== state.run.token) return;      // 先判 token 再计数，过期事件不进统计
+    let evt;
+    try { evt = JSON.parse(payload); } catch (e) { return; }
+    state.stream.events += 1;
+    handleEvent(evt, token);
+  }
+  function elapsedText() {
+    return ((Date.now() - state.run.started) / 1000).toFixed(1);
+  }
+  function handleEvent(evt, token) {
+    if (token !== state.run.token) return;     // 过期事件（上一张图 / 上一轮）：整条丢弃
+    switch (evt.type) {
+      case "round_start":
+        state.run.rounds = (evt.index || 0) + 1;
+        setLatest("第 " + state.run.rounds + " 轮开始" + (evt.thinking ? "（思考模式）" : "（已关闭思考）"));
+        break;
+      case "reasoning":
+        appendStream("reasoning", evt.text);
+        setLatest("思考中… 累计 " + state.stream.reasoningChars + " 字");
+        break;
+      case "content":
+        appendStream("content", evt.text);
+        setLatest("正文中… 累计 " + state.stream.contentChars + " 字");
+        break;
+      case "tool_call":
+        addToolCall(evt.name, evt.arguments);
+        setLatest("调用工具 " + evt.name);
+        break;
+      case "tool_result":
+        addToolResult(evt);
+        setLatest((evt.ok ? "✔ " : "✘ ") + "工具 " + evt.name + " · " + evt.elapsed_ms + " ms");
+        if (!evt.ok) pushAlert("warn", "工具 " + evt.name + " 执行失败（异常会作为文本回填给模型继续推理）", truncate(evt.content, 800));
+        break;
+      case "annotated":
+        state.run.gotAnnotated = true;
+        applyAnnotated(evt.url, evt.summary, evt.items, evt.accuracy);
+        // 后端在 done 之后才补发 annotated（标注要等事件流收集完再画），
+        // 所以这一行会覆盖掉"识别完成"的那行——把轮次与耗时并进来，别让信息丢掉
+        setLatest("已生成标注图 · " +
+          ((evt.summary && evt.summary.total) || (evt.items || []).length) + " 个目标（" +
+          state.run.rounds + " 轮 · " + elapsedText() + " s）");
+        setStatus("已生成标注图：" + ((evt.summary && evt.summary.total) || (evt.items || []).length) + " 个目标。", "ok");
+        break;
+      // error 之后后端还会补发 warning，别让 warning 覆盖掉失败原因
+      case "warning":
+        pushAlert("warn", evt.message, (evt.coord_warnings || []).join("\n"));
+        if (!state.run.failed) setStatus(evt.message, "warn");
+        break;
+      case "error":
+        state.run.failed = true;
+        pushAlert("error", evt.message);
+        setStatus(evt.message, "err");
+        appendStream("content", "\n[错误] " + evt.message + "\n");
+        setLatest("出错：" + truncate(evt.message, 60));
+        break;
+      case "done":
+        if (!state.run.gotAnnotated) setStatus("模型输出完成，但没有解析到坐标，未生成标注图。", "warn");
+        setLatest("识别完成（" + state.run.rounds + " 轮 · " + elapsedText() + " s）");
+        break;
+      // message 只是把完整的 assistant 消息回传一份（正文/工具调用已在增量事件里渲染过），
+      // 再展示一遍就是重复内容，故此处刻意忽略
+      case "message":
+      case "eof":
+        break;
+      default:
+        break;
+    }
+  }
+  async function startDetect() {
+    if (!state.image.id) {
+      setStatus("请先选择图片。", "err");
+      pushAlert("warn", "请先选择一张图片再发起识别。");
+      return;
+    }
+    if (state.run.active) { pushAlert("warn", "上一轮识别仍在进行中，请先取消或等它结束。"); return; }
+
+    cancelRun();                          // 先作废旧轮，再取新 token
+    const token = ++state.run.token;
+    const controller = new AbortController();
+    state.run.controller = controller;
+    state.run.active = true;
+    state.run.finished = false;
+    state.run.gotAnnotated = false;
+    state.run.failed = false;
+    state.run.rounds = 0;
+    state.run.started = Date.now();
+
+    clearAnnotated();                     // 清掉上一轮结果，否则"本轮没解析出坐标"时会继续显示旧标注图
+    resetStream();
+    renderResult();
+    renderViewer();
+    renderControls();
+    if (!state.view.thinking) {
+      $("logReasoning").textContent = "（已关闭思考模式，模型不会输出思维链）";
+      $("logReasoning").dataset.placeholder = "1";
+    }
+    setStatus(state.view.thinking ? "模型推理中（思考模式开启，流式输出）…" : "模型推理中（思考模式关闭，流式输出）…", "busy");
+    setLatest(state.view.thinking ? "已发起识别（思考模式）…" : "已发起识别（已关闭思考）…");
+
+    try {
+      const resp = await fetch("/api/detect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image_id: state.image.id,
+          prompt: $("prompt").value,
+          use_tools: $("useTools").checked,
+          thinking: state.view.thinking,
+          // 关闭思考时 reasoning_effort 不生效，索性不发，免得让人以为它在起作用
+          reasoning_effort: state.view.thinking ? state.view.effort : "",
+        }),
+        signal: controller.signal,
+      });
+      if (!resp.ok || !resp.body) throw new Error(await readError(resp));
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        if (token !== state.run.token) { try { reader.cancel(); } catch (e) { /* 已取消 */ } return; }
+        // 统一行尾：若中间层把换行改写成 CRLF，按空行切分会整条流都找不到事件边界
+        buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
+        let cut = buffer.indexOf("\n\n");
+        while (cut >= 0) {
+          const block = buffer.slice(0, cut);
+          buffer = buffer.slice(cut + 2);
+          handleSseBlock(block, token);
+          cut = buffer.indexOf("\n\n");
+        }
+      }
+      if (token === state.run.token && !state.run.failed) {
+        setStatus(state.run.gotAnnotated ? "识别完成，已生成标注图。" : "识别完成。", "ok");
+      }
+    } catch (e) {
+      if (e && e.name === "AbortError") return;       // 主动取消不是错误
+      if (token === state.run.token) {
+        setStatus("识别失败：" + e.message, "err");
+        pushAlert("error", "识别请求失败：" + e.message);
+      }
+    } finally {
+      // 只有"当前这一轮"才能复位：旧轮的 finally 不能把新一轮的按钮放开
+      if (token === state.run.token) {
+        state.run.active = false;
+        state.run.controller = null;
+        state.run.finished = true;
+        renderConsoleMeta();
+        renderControls();
+      }
+    }
+  }
+
+  /* ======================================================================
+   * 12. 用户偏好：思考模式 / 思考强度 / 对比模式
+   * ==================================================================== */
+  function setThinking(on, persist) {
+    state.view.thinking = !!on;
+    if (persist) state.view.thinkingTouched = true;
+    $("thinking").checked = state.view.thinking;
+    $("thinkingHint").textContent = state.view.thinking
+      ? "开启：先流式输出思维链（reasoning_content）再给正文，复杂推理更稳，但更慢、更耗 token（实测同批基准图约 4.9 s）。"
+      : "关闭：模型直接给正文。实测同批基准图快约 2.2 倍（4.9 s → 2.2 s）且准确率不降；此时 reasoning_effort 不生效。";
+    $("reasoningEffort").disabled = !state.view.thinking;
+    if (persist) writeStore(STORE.thinking, state.view.thinking ? "1" : "0");
+  }
+  function setEffort(value, persist) {
+    state.view.effort = value || "";
+    $("reasoningEffort").value = state.view.effort;
+    if (persist) writeStore(STORE.effort, state.view.effort);
+  }
+
+  /* ======================================================================
+   * 13. 滑块交互：鼠标 / 触摸 / 键盘（role=slider，左右方向键微调）
+   * ==================================================================== */
+  function bindSlider() {
+    const overlay = $("stackOverlay");
+    const handle = $("sliderHandle");
+    let dragging = false;
+    const setFromClientX = (clientX) => {
+      const rect = overlay.getBoundingClientRect();
+      if (!rect.width) return;        // 容器不可见时算比例会得到 NaN
+      state.view.split = clamp(((clientX - rect.left) / rect.width) * 100, 0, 100);
+      applySplit();
+    };
+    const down = (e) => {
+      dragging = true;
+      e.preventDefault();
+      handle.focus();
+      setFromClientX(e.touches ? e.touches[0].clientX : e.clientX);
+    };
+    const move = (e) => { if (dragging) setFromClientX(e.touches ? e.touches[0].clientX : e.clientX); };
+    const up = () => { dragging = false; };
+    overlay.addEventListener("mousedown", down);
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+    overlay.addEventListener("touchstart", down, { passive: true });
+    overlay.addEventListener("touchmove", move, { passive: true });
+    window.addEventListener("touchend", up);
+    handle.addEventListener("keydown", (e) => {
+      const step = e.shiftKey ? 10 : 2;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      state.view.split = clamp(state.view.split + (e.key === "ArrowRight" ? step : -step), 0, 100);
+      applySplit();
+      e.preventDefault();
+    });
+  }
+  // Tab 列表的键盘约定：左右方向键在 tab 间移动，且只有一个 tab 能被 Tab 键聚焦
+  function bindTablist(containerId, resolve) {
+    const box = $(containerId);
+    box.addEventListener("click", (e) => {
+      const tab = e.target.closest("[role=tab]");
+      if (tab) resolve(tab);
+    });
+    box.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const tabs = Array.prototype.slice.call(box.querySelectorAll("[role=tab]"));
+      const index = tabs.indexOf(document.activeElement);
+      if (index < 0) return;
+      const offset = e.key === "ArrowRight" ? 1 : tabs.length - 1;
+      const next = tabs[(index + offset) % tabs.length];
+      e.preventDefault();
+      next.focus();
+      resolve(next);
+    });
+  }
+
+  /* ======================================================================
+   * 14. 运行状态：/api/health（provider / 工具数 / 思考模式默认值）
+   * ==================================================================== */
+  async function loadHealth() {
+    const badge = $("providerBadge");
+    try {
+      const resp = await fetch("/api/health");
+      if (!resp.ok) throw new Error(await readError(resp));
+      const h = await resp.json();
+      state.health = h;
+      if (h.provider === "mock") {
+        badge.className = "badge warn";
+        badge.textContent = "离线 Mock（未配置 API Key）";
+        pushAlert("warn", "当前是离线 Mock 模式：没读到 DEEPSEEK_API_KEY，输出是模拟数据，不代表真实识别效果。");
+      } else {
+        badge.className = "badge ok";
+        badge.textContent = h.provider + " · " + h.model;
+      }
+      badge.title = "provider=" + h.provider + " · model=" + h.model + " · base_url=" + h.base_url +
+                    " · 思考模式默认=" + h.thinking + " · reasoning_effort=" + h.reasoning_effort;
+      $("toolsBadge").textContent = "工具 " + h.tools.length + " 个";
+      $("toolsBadge").title = h.tools.join("\n");
+      // 思考开关初值：优先用户上次的选择，其次服务端默认（THINKING 环境变量）
+      if (!state.view.thinkingTouched) setThinking(h.thinking !== false, false);
+    } catch (e) {
+      badge.className = "badge err";
+      badge.textContent = "服务未就绪";
+      pushAlert("error", "无法连接后端 /api/health：" + e.message);
+    }
+  }
+
+  /* ======================================================================
+   * 15. 事件绑定与初始化
+   * ==================================================================== */
+  function renderAll() {
+    renderImage();
+    renderControls();
+    renderViewer();
+    renderResult();
+    renderConsoleMeta();
+    renderAlerts();
+  }
+  function bindEvents() {
+    // 告警条用事件委托：告警条内容整块重绘，逐条挂 listener 会随重绘丢掉
+    $("alertBar").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-alert-index]");
+      if (btn) dismissAlert(Number(btn.dataset.alertIndex));
+    });
+
+    bindTablist("sourceTabs", (tab) => setSource(tab.dataset.source));
+    bindTablist("modeTabs", (tab) => setMode(tab.dataset.mode, true));
+
+    // ---- 图片源 ----
+    const openPicker = () => $("fileInput").click();
+    $("btnPickFile").addEventListener("click", openPicker);
+    $("dropZone").addEventListener("click", openPicker);
+    $("dropZone").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openPicker(); }
+    });
+    $("fileInput").addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (file) uploadFile(file);
+      e.target.value = "";          // 复位以便连续选择同一个文件也能触发 change
+    });
+    $("btnLoadUrl").addEventListener("click", loadFromUrl);
+    $("urlInput").addEventListener("keydown", (e) => { if (e.key === "Enter") loadFromUrl(); });
+    $("btnDemoImage").addEventListener("click", loadDemoImage);
+    $("sampleGroups").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-sample-id]");
+      if (btn) loadSampleImage(btn.dataset.sampleId, btn);
+    });
+    ["dragenter", "dragover"].forEach((name) => document.addEventListener(name, (e) => {
+      e.preventDefault();
+      $("dropZone").classList.add("dragover");
+    }));
+    ["dragleave", "dragend"].forEach((name) => document.addEventListener(name, () => {
+      $("dropZone").classList.remove("dragover");
+    }));
+    document.addEventListener("drop", (e) => {
+      e.preventDefault();
+      $("dropZone").classList.remove("dragover");
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!file) return;
+      setSource("file");
+      uploadFile(file);
+    });
+
+    // ---- 识别 ----
+    $("btnDetect").addEventListener("click", startDetect);
+    $("btnCancel").addEventListener("click", onCancelClick);
+    $("thinking").addEventListener("change", (e) => setThinking(e.target.checked, true));
+    $("reasoningEffort").addEventListener("change", (e) => setEffort(e.target.value, true));
+    $("prompt").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); startDetect(); }
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && state.run.active) onCancelClick();
+    });
+
+    // ---- 手动标注 ----
+    $("btnManualApply").addEventListener("click", manualAnnotate);
+    $("btnFillGt").addEventListener("click", fillGroundTruth);
+    $("btnClearAnno").addEventListener("click", clearAnnotation);
+
+    // ---- 控制台 ----
+    $("btnClearOutput").addEventListener("click", () => { resetStream(); setLatest("控制台已清空"); });
+    $("btnToggleConsole").addEventListener("click", () => setConsoleCollapsed(!state.view.consoleCollapsed));
+    $("btnToggleReasoning").addEventListener("click", () => toggleSection("btnToggleReasoning", "logReasoning"));
+    $("btnToggleContent").addEventListener("click", () => toggleSection("btnToggleContent", "logContent"));
+    $("btnToggleTools").addEventListener("click", () => toggleSection("btnToggleTools", "logTools"));
+
+    // ---- 叠加不透明度 ----
+    $("opacity").addEventListener("input", (e) => {
+      state.view.opacity = Number(e.target.value) / 100;
+      applyOpacity();
+    });
+
+    // ---- 图片加载失败（例如 runs/ 被清理后标注图 404）：给提示而不是破图标 ----
+    ["sideBefore", "stackBefore"].forEach((id) => $(id).addEventListener("error", () => {
+      pushAlert("error", "原图加载失败，请重新选择图片。");
+    }));
+    ["sideAfter", "stackAfter"].forEach((id) => $(id).addEventListener("error", () => {
+      if (state.result.annotatedUrl) pushAlert("error", "标注图加载失败（结果文件可能已被清理），请重新识别。");
+    }));
+  }
+
+  function init() {
+    // 用户偏好恢复：先按本地记忆渲染，/api/health 回来后只补"没被用户改过"的默认值
+    const savedThinking = readStore(STORE.thinking);
+    setThinking(savedThinking === null ? true : savedThinking === "1", false);
+    setEffort(readStore(STORE.effort) || "", false);
+    const savedMode = readStore(STORE.mode);
+    setMode(savedMode && MODE_TABS[savedMode] ? savedMode : "side", false);
+    setSource("sample");
+    $("consoleRail").hidden = false;      // 显隐完全交给 CSS（只有折叠时才显示）
+    setConsoleCollapsed(false);
+    applySplit();
+    applyOpacity();
+    renderAll();
+    bindEvents();
+    bindSlider();
+    // 图片解码完成前 getBoundingClientRect 量到的是 0，覆盖层会贴不上，必须等 load
+    $("stackBefore").addEventListener("load", scheduleSyncFrame);
+    if (window.ResizeObserver) new ResizeObserver(scheduleSyncFrame).observe($("cmpStage"));
+    window.addEventListener("resize", scheduleSyncFrame);
+    loadHealth();
+    loadSampleCatalog();
+  }
+
+  init();
+
+
+})();
+
+</script>
+</body>
+</html>

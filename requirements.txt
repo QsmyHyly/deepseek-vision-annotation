@@ -1,0 +1,9 @@
+# 核心依赖
+openai>=1.0            # DeepSeek 使用 OpenAI 兼容协议
+requests>=2.31         # 下载图片
+Pillow>=10.0           # 图像加载与标注绘制
+
+# Web 对比查看服务
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9   # FastAPI 上传文件（UploadFile）需要
