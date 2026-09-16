@@ -25,7 +25,7 @@ DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTM
 
   · 顶部告警条（#alertBar）—— 只放「错误 / 告警 / 需要人介入的提示」，写进 DOM 就不会丢。
     旧版把错误混进流式日志，长输出一滚就找不到了，这是本次最重要的可用性修复。
-  · 左栏（控制）—— ① 图片源（三个来源合并成一张卡的三个 Tab）
+  · 左栏（控制）—— ① 图片源（四个 Tab：本地上传 / 图片 URL / 内置测试图 / 历史记录）
                      ② 识别参数（提示词 / 工具 / 思考 / 强度 / 发起与取消）
                      ③ 手动标注（离线工具，与模型链路无关，故单独成卡）
   · 中栏（对比查看区）—— 主角。占满剩余高度，三种对比模式 + 结果指标条。
@@ -34,6 +34,23 @@ DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTM
 
 「行为状态」也按这个分层各归其位：操作进度 → 左栏状态行(#statusLine)；
 错误与告警 → 顶部告警条；模型输出 → 右栏控制台。三者不再互相覆盖。
+
+④「历史记录」是同一张卡里的**第 4 个 Tab**，但它不是第四个"图片来源"——它给的是
+**回看已存结果**，不是"换一张图"。这层语义必须写死在实现里，否则很容易做歪：
+
+  · **回看 ≠ 重新识别**。点「载入」只做两个 GET（GET /api/history/<run_id> 取记录全文、
+    GET /api/history/<run_id>/source 取原图），再复用既有的 applyImage + applyAnnotated，
+    把「原图 / 标注图 / 坐标 / 准确率」照原样铺回对比区。**绝不调用 /api/detect**，
+    也不碰「识别」按钮与流式控制台 —— 一次识别要花钱、要等模型，回看只是读盘，两者不能混。
+  · 记录存在**服务端磁盘**上（runs/history/<run_id>/meta.json + annotated.png，见
+    @doc AGENTS.md#4.9-上传--结果存储--历史记录），服务重启后仍然在；前端不持有任何记录缓存，
+    列表永远以 GET /api/history 的返回为准。
+  · 列表**懒加载**：只在切到该 Tab 时才请求，页面一打开就拉几十条既没必要又多一次扫盘。
+    每条用 thumb_url（?w=160 的缩略图）而不是原标注图 —— 后者可能 2 MB，几十条会拖垮页面。
+  · 原图可能已经不在磁盘上（source_url 404）。这不是崩溃场景：图片的 error 事件给一条
+    warn 告警，标注图与坐标照常显示（见 bindEvents 里的图片加载失败处理）。
+  · 列表 / 空态(#historyEmpty) / 计数(#historyCount) 全部由 renderHistory() 从 state.history
+    投影出来，加载与删除失败一律走顶部告警条，不把错误塞进列表。
 
 --------------------------------------------------------------------------------
 二、状态模型：一个 state + 若干纯渲染函数
@@ -48,6 +65,7 @@ DeepSeek 物体定位演示 · 前端页面（单文件 / 零构建 / 原生 HTM
     state.stream 流式计数与"最新一行"
     state.view   纯 UI 偏好（对比模式 / 分隔线位置 / 不透明度 / 缩放平移 / 思考开关 / 左右栏折叠）
     state.alerts 顶部告警条的内容栈
+    state.history 历史记录面板（懒加载列表 / 总数 / 载入中 / 错误 / 当前正在回看的记录）
 
 改动状态后调用对应的 renderXxx()，不在事件回调里零散地碰 DOM。
 渲染函数是幂等的：任何时刻重跑一遍都能得到与状态一致的界面。
@@ -348,6 +366,47 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   .tag-gt { border-color: rgba(61, 220, 151, .45); color: var(--ok); }
   .sample-item-purpose { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; line-height: 1.5; }
 
+  /* 历史记录面板（第 4 个 Tab，懒加载；语义见文件头「一、信息架构」④） */
+  .history-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .btn.danger { border-color: rgba(255, 122, 122, .45); color: var(--err); }
+  .btn.danger:hover:not(:disabled) { background: rgba(60, 20, 26, .6); border-color: var(--err); }
+  .history-count {
+    margin-left: auto; color: var(--muted); font-size: 11.5px;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .history-list { margin-top: 8px; max-height: 300px; overflow: auto; padding-right: 2px; }
+  .history-item {
+    display: flex; gap: 8px; align-items: flex-start;
+    background: var(--bg-soft); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+    padding: 6px 8px; margin-bottom: 5px;
+  }
+  .history-item:hover { border-color: var(--accent); }
+  /* 缩略图固定在 56px 的框里显示（object-fit: contain），但 naturalWidth 仍是 ?w=160 那张图 */
+  .history-thumb {
+    width: 56px; height: 56px; flex: 0 0 auto; object-fit: contain;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+  }
+  .history-body { flex: 1 1 auto; min-width: 0; }
+  .history-head { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+  .history-time { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .tag-kind {
+    font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .tag-kind.detect { border-color: rgba(91, 140, 255, .5); color: var(--accent-2); }
+  .tag-kind.annotate { border-color: rgba(247, 185, 85, .45); color: var(--warn); }
+  .tag-metric { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .tag-metric.ok { border-color: rgba(61, 220, 151, .45); color: var(--ok); }
+  .tag-metric.warn { border-color: rgba(247, 185, 85, .45); color: var(--warn); }
+  .tag-metric.bad { border-color: rgba(255, 122, 122, .5); color: var(--err); }
+  .history-prompt { display: block; color: var(--muted); font-size: 11px; margin-top: 3px; line-height: 1.5; word-break: break-word; }
+  .history-acts { display: flex; gap: 6px; margin-top: 5px; }
+  .history-empty {
+    margin-top: 10px; padding: 14px 12px; text-align: center; color: var(--muted);
+    font-size: 12px; line-height: 1.7;
+    border: 1px dashed var(--line); border-radius: var(--radius-sm); background: var(--bg-soft);
+  }
+
   .image-info {
     margin-top: 10px; padding: 7px 9px; border-radius: var(--radius-sm);
     background: var(--bg-soft); border: 1px solid var(--line-soft);
@@ -634,6 +693,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
         <button class="tab" type="button" id="tabFile" role="tab" data-source="file" aria-selected="true" aria-controls="panelFile">本地上传</button>
         <button class="tab" type="button" id="tabUrl" role="tab" data-source="url" aria-selected="false" aria-controls="panelUrl" tabindex="-1">图片 URL</button>
         <button class="tab" type="button" id="tabSample" role="tab" data-source="sample" aria-selected="false" aria-controls="panelSample" tabindex="-1">内置测试图</button>
+        <button class="tab" type="button" id="tabHistory" role="tab" data-source="history" aria-selected="false" aria-controls="panelHistory" tabindex="-1">历史记录</button>
       </div>
 
       <div id="panelFile" role="tabpanel" aria-labelledby="tabFile">
@@ -663,6 +723,20 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
         <p class="hint" id="sampleMeta">目录加载中…</p>
         <div class="sample-list" id="sampleGroups"></div>
         <p class="hint">点任意一张即载入，并自动填入它对应的建议提示词；带「真值」标记的图在识别后由程序自动算检出率 / 平均 IoU / 标签准确率（判定口径见 @doc AGENTS.md#7-打标准确率评测结论）。</p>
+      </div>
+
+      <!-- ④ 历史记录：回看已存结果（≠ 重新识别）。列表懒加载，点 Tab 才请求 -->
+      <div id="panelHistory" role="tabpanel" aria-labelledby="tabHistory" hidden>
+        <div class="history-bar">
+          <button class="btn tiny" type="button" id="btnHistoryRefresh">刷新</button>
+          <button class="btn tiny danger" type="button" id="btnHistoryClear"
+                  aria-label="清空全部历史记录">清空全部</button>
+          <span class="history-count" id="historyCount" role="status" aria-live="polite">未加载</span>
+        </div>
+        <div class="history-list" id="historyList"></div>
+        <p class="history-empty" id="historyEmpty" hidden>还没有打标记录。发起一次识别，或做一次手动标注，就会出现在这里。</p>
+        <p class="hint">点「载入」只是把已存的结果取回来回看（原图 + 标注图 + 坐标），
+          <strong>不会重新发起识别</strong>；记录存在服务端 <code>runs/history/</code> 磁盘上，重启服务后仍然在。</p>
       </div>
 
       <p class="image-info" id="imageInfo">尚未选择图片。</p>
@@ -860,8 +934,11 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
    * ==================================================================== */
   const STORE = { thinking: "objloc.thinking", effort: "objloc.effort", mode: "objloc.compareMode" };
   // 用"字面量 id"登记一切需要按状态显隐的元素：渲染函数里只按名字取，不散落字符串
-  const SOURCE_PANELS = { file: "panelFile", url: "panelUrl", sample: "panelSample" };
-  const SOURCE_TABS = { file: "tabFile", url: "tabUrl", sample: "tabSample" };
+  // history 是第 4 个"源 Tab"：与另外三个共用同一套 data-source 切换机制，
+  // 但它不换图，而是回看已存结果（懒加载，见 setSource 与 loadHistory）
+  const SOURCE_PANELS = { file: "panelFile", url: "panelUrl", sample: "panelSample", history: "panelHistory" };
+  const SOURCE_TABS = { file: "tabFile", url: "tabUrl", sample: "tabSample", history: "tabHistory" };
+  const HISTORY_PAGE = 50;            // 一页拉多少条（列表项不含 items，只带缩略图 URL）
   const MODE_TABS = { side: "tabModeSide", slider: "tabModeSlider", overlay: "tabModeOverlay" };
   const ALERT_LABEL = { error: "错误", warn: "告警", info: "提示", ok: "完成" };
   const ALERT_LIMIT = 5;                 // 告警条最多同时显示几条，超出丢最旧的
@@ -897,6 +974,10 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     },
     alerts: [],
     samples: [],
+    // 历史记录面板：列表懒加载（切到该 Tab 才请求，见 setSource）。
+    // signature 用来判断"列表内容变没变"——幂等渲染不该每次都重建 innerHTML（缩略图会重新加载）。
+    // viewing 是"当前正在回看的记录"，只在 source_url 404 时用于给出更准确的告警。
+    history: { loaded: false, loading: false, records: [], total: null, error: null, signature: "", viewing: null },
   };
 
   /* ======================================================================
@@ -995,6 +1076,9 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
       tab.setAttribute("aria-selected", on ? "true" : "false");
       tab.tabIndex = on ? 0 : -1;       // 漫游 tabindex：Tab 键只落在当前选中的那个
     });
+    // 历史记录懒加载：切到该 Tab 才拉列表。页面一打开就请求既没必要，也多一次全目录扫盘
+    // （"持久化"= 每次现场扫 runs/history/*/meta.json，见 AGENTS.md#4.9）。
+    if (name === "history" && !state.history.loaded && !state.history.loading) loadHistory();
   }
   function renderSampleCatalog(data) {
     const box = $("sampleGroups");
@@ -1027,6 +1111,156 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
       $("sampleGroups").innerHTML = '<p class="hint err">' + escapeHtml(e.message) + "</p>";
       pushAlert("error", "内置测试图目录加载失败：" + e.message);
     }
+  }
+
+  /* ======================================================================
+   * 4.1 历史记录（第 4 个源 Tab）：回看已存结果 ≠ 重新识别
+   * ======================================================================
+   * 语义见文件头「一、信息架构」④：这里只做读盘（GET /api/history 系列）+ 复用既有的
+   * applyImage / applyAnnotated 把结果铺回对比区。**绝不调用 /api/detect**。
+   * 列表项字段（run_id / created_at / kind / prompt / n_items / accuracy / 三个 url）见
+   * @doc AGENTS.md#4.9-上传--结果存储--历史记录 —— 改后端字段时改这里的渲染。
+   * -------------------------------------------------------------------- */
+  // 一条记录的卡片。⚠️ 所有插进 innerHTML 的文本（kind / prompt / run_id / url）都过 escapeHtml：
+  // prompt 与文件名来自用户输入，永远当成不可信文本。
+  function historyItemHtml(rec) {
+    const runId = String(rec.run_id || "");
+    const acc = rec.accuracy || null;
+    // 缩略图必须走 thumb_url（= annotated_url + ?w=160）：原标注图可能 2 MB，
+    // 几十条全量加载会把页面拖垮。拿不到 thumb_url 才退回原图 URL。
+    const thumb = rec.thumb_url || rec.annotated_url || "";
+    const time = String(rec.created_at || "").replace("T", " ");
+    return '<div class="history-item" data-run-id="' + escapeHtml(runId) + '">' +
+      '<img class="history-thumb" src="' + escapeHtml(thumb) + '" alt="" loading="lazy" />' +
+      '<div class="history-body">' +
+        '<div class="history-head">' +
+          '<span class="history-time">' + escapeHtml(time) + "</span>" +
+          '<span class="tag-kind ' + (rec.kind === "detect" ? "detect" : "annotate") + '">' +
+            escapeHtml(rec.kind || "?") + "</span>" +
+          '<span class="tag-size">' + (Number(rec.n_items) || 0) + " 个目标</span>" +
+          (acc
+            ? '<span class="tag-metric ' + levelOf("detection_rate", acc.detection_rate) + '">检出 ' +
+              fmtPct(acc.detection_rate) + " · IoU " + fmtNum(acc.mean_iou) + "</span>"
+            : "") +
+        "</div>" +
+        '<span class="history-prompt">' + escapeHtml(truncate(rec.prompt || "（未填写提示词）", 60)) + "</span>" +
+        '<div class="history-acts">' +
+          '<button class="btn tiny" type="button" data-history-load="' + escapeHtml(runId) + '"' +
+            ' aria-label="载入历史记录 ' + escapeHtml(runId) + '">载入</button>' +
+          '<button class="btn tiny ghost danger" type="button" data-history-del="' + escapeHtml(runId) + '"' +
+            ' aria-label="删除历史记录 ' + escapeHtml(runId) + '">删除</button>' +
+        "</div>" +
+      "</div>" +
+    "</div>";
+  }
+  function renderHistory() {
+    const h = state.history;
+    // 列表整块重绘会让缩略图重新发起请求；内容没变就不动 DOM（渲染函数是幂等的）
+    const signature = JSON.stringify([h.loading, h.error, h.total, h.records.map((r) => r.run_id)]);
+    if (signature !== h.signature) {
+      h.signature = signature;
+      $("historyList").innerHTML = h.records.map(historyItemHtml).join("");
+    }
+    $("historyCount").textContent = h.loading ? "加载中…"
+      : h.error ? "加载失败"
+      : h.total == null ? "未加载"
+      : "共 " + h.total + " 条" + (h.records.length < h.total ? "（显示最近 " + h.records.length + " 条）" : "");
+    // 空态只在"确实读到了 0 条"时出现；加载失败要走顶部告警条，不能伪装成"还没有记录"
+    $("historyEmpty").hidden = !(!h.loading && !h.error && !h.records.length);
+    $("btnHistoryRefresh").disabled = !!h.loading;
+    $("btnHistoryClear").disabled = !!h.loading || !h.records.length;
+  }
+  /** 拉取历史列表（默认一页 50 条，倒序）。失败只写顶部告警条，并保留上一次的列表。 */
+  async function loadHistory() {
+    const h = state.history;
+    h.loading = true;
+    renderHistory();
+    try {
+      const resp = await fetch("/api/history?limit=" + HISTORY_PAGE);
+      if (!resp.ok) throw new Error(await readError(resp));
+      const data = await resp.json();
+      h.records = data.records || [];
+      h.total = typeof data.total === "number" ? data.total : h.records.length;
+      h.error = null;
+      h.loaded = true;          // 只有真成功过才算"已加载"，失败时下次切 Tab 仍会重试
+    } catch (e) {
+      h.error = e.message;
+      pushAlert("error", "历史记录加载失败：" + e.message);
+    } finally {
+      h.loading = false;
+      renderHistory();
+    }
+  }
+  /**
+   * 载入一条历史记录：**回看**，不是"重新识别"。
+   *
+   * 两个 GET 之后完全复用既有路径：applyImage 换原图（内部 cancelRun + clearAnnotated +
+   * resetStream + setZoomFit，所以载入后 state.run 不处于"进行中"，缩放/全屏照常可用），
+   * applyAnnotated 铺标注图与坐标。中途没有任何 /api/detect 调用。
+   */
+  async function loadHistoryRecord(runId) {
+    setStatus("载入历史记录 " + runId + "…", "busy");
+    try {
+      const resp = await fetch("/api/history/" + encodeURIComponent(runId));
+      if (!resp.ok) throw new Error(await readError(resp));
+      const rec = await resp.json();
+      const src = rec.source || {};
+      applyImage({
+        id: src.image_id, url: rec.source_url,
+        width: src.width, height: src.height, filename: src.filename,
+      });
+      // 原图可能已经被删（source_url 404）：记住"这次是回看"，图片 error 事件据此给 warn
+      state.history.viewing = rec;
+      applyAnnotated(rec.annotated_url, rec.summary, rec.items, rec.accuracy);
+      const total = (rec.summary && rec.summary.total) || (rec.items || []).length;
+      setStatus("已载入历史记录（" + String(rec.created_at || "").replace("T", " ") + " 的" +
+                (rec.kind === "detect" ? "识别" : "手动标注") + "结果，" + total +
+                " 个目标）。这是回看，不会重新发起识别。", "ok");
+    } catch (e) {
+      setStatus("历史记录载入失败：" + e.message, "err");
+      pushAlert("error", "历史记录载入失败：" + e.message);
+    }
+  }
+  /** 删一条记录（服务端连 runs/history/<run_id>/ 整个目录一起删）。 */
+  async function deleteHistoryRecord(runId) {
+    setStatus("删除历史记录 " + runId + "…", "busy");
+    try {
+      const resp = await fetch("/api/history/" + encodeURIComponent(runId), { method: "DELETE" });
+      if (!resp.ok) throw new Error(await readError(resp));
+      // 先本地摘掉给即时反馈，再以服务端返回为准重算总数
+      state.history.records = state.history.records.filter((r) => r.run_id !== runId);
+      renderHistory();
+      await loadHistory();
+      setStatus("已删除历史记录 " + runId + "。", "ok");
+    } catch (e) {
+      setStatus("删除历史记录失败：" + e.message, "err");
+      pushAlert("error", "删除历史记录失败：" + e.message);
+    }
+  }
+  /** 清空全部记录。危险操作：不可撤销，故二次确认（按钮本身也是 danger 样式）。 */
+  async function clearHistory() {
+    const ok = window.confirm("清空全部打标历史记录？\n\n会删掉服务端 runs/history/ 下的每条记录目录" +
+                             "（源图不动）。此操作不可撤销。");
+    if (!ok) return;
+    setStatus("清空历史记录…", "busy");
+    try {
+      const resp = await fetch("/api/history", { method: "DELETE" });
+      if (!resp.ok) throw new Error(await readError(resp));
+      const data = await resp.json();
+      await loadHistory();
+      setStatus("已清空 " + (data.removed || 0) + " 条历史记录。", "ok");
+    } catch (e) {
+      setStatus("清空历史记录失败：" + e.message, "err");
+      pushAlert("error", "清空历史记录失败：" + e.message);
+    }
+  }
+  /**
+   * 新记录落盘后刷新列表（识别成功的 annotated 事件 / 手动标注成功后调用）。
+   * 只在"用户已经看过历史"时才请求，否则保持懒加载——没打开过就没必要为一个看不见的计数发请求。
+   */
+  function refreshHistoryIfLoaded() {
+    if (!state.history.loaded && state.source !== "history") return;
+    return loadHistory();
   }
 
   /* ======================================================================
@@ -1570,6 +1804,9 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   }
   function applyImage(record) {
     cancelRun();                     // 换图 = 作废在途识别，旧事件不会写到新图上
+    // 任何一个"换图"入口都会走到这里，所以默认不是回看历史；
+    // loadHistoryRecord 在自己的 applyImage 之后立刻把它设回去（见 4.1）。
+    state.history.viewing = null;
     state.image = {
       id: record.id,
       url: record.url,
@@ -1712,6 +1949,8 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
       if (!resp.ok) throw new Error(await readError(resp));
       const data = await resp.json();
       applyAnnotated(data.annotated_url, data.summary, data.items, data.accuracy);
+      // 这次标注已经在服务端落了一条历史记录：列表/计数跟着更新，否则用户会以为没存上
+      refreshHistoryIfLoaded();
       const notes = [data.notice, data.warning].filter(Boolean);
       notes.forEach((n) => pushAlert("warn", n));
       setStatus(notes.length ? "标注完成（有告警，见顶部提示条）。" : "手动标注完成。", notes.length ? "warn" : "ok");
@@ -1788,6 +2027,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
           ((evt.summary && evt.summary.total) || (evt.items || []).length) + " 个目标（" +
           state.run.rounds + " 轮 · " + elapsedText() + " s）");
         setStatus("已生成标注图：" + ((evt.summary && evt.summary.total) || (evt.items || []).length) + " 个目标。", "ok");
+        refreshHistoryIfLoaded();     // 这轮识别已落一条历史记录（见 4.1）
         break;
       // error 之后后端还会补发 warning，别让 warning 覆盖掉失败原因
       case "warning":
@@ -2013,6 +2253,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   function renderAll() {
     renderImage();
     renderControls();
+    renderHistory();       // 幂等：内容没变时不重建列表（见 4.1）
     renderViewer();
     renderResult();
     renderConsoleMeta();
@@ -2075,6 +2316,16 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
       if (e.key === "Escape" && state.run.active) onCancelClick();
     });
 
+    // ---- 历史记录（列表整块重绘，逐条挂 listener 会随重绘丢掉，故与告警条一样用事件委托）----
+    $("btnHistoryRefresh").addEventListener("click", () => loadHistory());
+    $("btnHistoryClear").addEventListener("click", clearHistory);
+    $("historyList").addEventListener("click", (e) => {
+      const load = e.target.closest("[data-history-load]");
+      if (load) { loadHistoryRecord(load.dataset.historyLoad); return; }
+      const del = e.target.closest("[data-history-del]");
+      if (del) deleteHistoryRecord(del.dataset.historyDel);
+    });
+
     // ---- 手动标注 ----
     $("btnManualApply").addEventListener("click", manualAnnotate);
     $("btnFillGt").addEventListener("click", fillGroundTruth);
@@ -2096,6 +2347,14 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
 
     // ---- 图片加载失败（例如 runs/ 被清理后标注图 404）：给提示而不是破图标 ----
     ["sideBefore", "stackBefore"].forEach((id) => $(id).addEventListener("error", () => {
+      // 回看历史时原图可能已被删（source_url 404）：记录还在、原件没了，属于可预期情形，
+      // 给 warn 而不是"请重新选择图片"，且标注图与坐标照常显示，流程不中断（见 4.1）。
+      const hist = state.history.viewing;
+      if (hist) {
+        pushAlert("warn", "该历史记录的原图已不在磁盘上（" +
+                          (((hist.source || {}).filename) || hist.run_id) + "），只能查看标注图。");
+        return;
+      }
       pushAlert("error", "原图加载失败，请重新选择图片。");
     }));
     ["sideAfter", "stackAfter"].forEach((id) => $(id).addEventListener("error", () => {

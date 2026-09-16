@@ -38,6 +38,20 @@ const consoleErrors = [];
 page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text()); });
 page.on("pageerror", (e) => consoleErrors.push("pageerror: " + e.message));
 
+// ---- 历史记录断言组（文件末尾）用的 HTTP 助手与"开跑前的历史快照" ----
+// ui_check 自己就会产生历史记录（第 3 步的手动标注就落一条），所以先记下开跑前的全部 run_id：
+// 收尾只删"这次跑出来的"，用户原有的记录一条都不能少。
+const httpJson = async (p, init) => {
+  const r = await fetch(BASE + p, init);
+  const body = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(p + " -> HTTP " + r.status + " " + JSON.stringify(body));
+  return body;
+};
+const historyRunIds = async () =>
+  (await httpJson("/api/history?limit=1000")).records.map((r) => r.run_id);
+const preexistingRunIds = new Set(await historyRunIds());
+console.log("开跑前历史记录 " + preexistingRunIds.size + " 条（跑完必须原样保留）");
+
 await page.goto(BASE, { waitUntil: "networkidle" });
 await page.waitForSelector("#sampleGroups button", { timeout: 15000 });
 const sampleCount = await page.locator("#sampleGroups button").count();
@@ -590,6 +604,271 @@ await page.click("#btnToggleConsole");
 await page.setViewportSize({ width: 900, height: 900 });
 await page.waitForTimeout(400);
 await page.screenshot({ path: "runs/ui/narrow.png", fullPage: false });
+
+/* ======================================================================
+ * 13. 历史记录面板（第 4 个源 Tab）——「回看已存结果」而不是「重新识别」
+ * ======================================================================
+ * 这一组会真的增删历史记录，三条自保措施（缺一条就可能给用户留垃圾或删掉用户数据）：
+ *   · 开跑前记下全部 run_id（见文件顶部），收尾只删"这次跑出来的"；
+ *   · 验证「清空全部」之前先把 runs/history/ 整目录备份到 runs/ui/history_backup，
+ *     验完在 finally 里还原并**逐条复核**用户原有记录是否都回来了；
+ *   · 整个断言组包在 try/finally 里，收尾只依赖 node:fs 与 HTTP，浏览器崩了也照样能清理。
+ * ⚠️ 全程只用 POST /api/sample + POST /api/annotate（离线画图），绝不调用 /api/detect。
+ * ==================================================================== */
+await page.setViewportSize({ width: 1440, height: 900 });
+await page.waitForTimeout(300);
+
+const HISTORY_DIR = path.join("runs", "history");
+const HISTORY_BACKUP = path.join("runs", "ui", "history_backup");
+const createdRunIds = [];        // 本组造出来的记录（收尾必删）
+let createdUpload = null;       // 本组 /api/sample 落下的源图文件（收尾一并清掉）
+const waitSoft = async (fn, arg, timeout = 8000) => {
+  try { await page.waitForFunction(fn, arg, { timeout }); return true; } catch (e) { return false; }
+};
+const cardCount = () => page.locator("#historyList .history-item").count();
+const RUN_ID_RE = /^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$/;
+// ⚠️ 不要用 fs.cpSync(..., {recursive:true})：本机 node v22.20.0 上它对 runs/history
+// 这种"目录里套目录"的结构会**硬崩进程**（0xC0000409 STATUS_STACK_BUFFER_OVERRUN，
+// 不是抛异常，catch 不住，缓冲区里的测试输出也一起丢）。改成手写递归 copyFileSync。
+const copyTree = (from, to) => {
+  fs.mkdirSync(to, { recursive: true });
+  let n = 0;
+  for (const e of fs.readdirSync(from, { withFileTypes: true })) {
+    const a = path.join(from, e.name), b = path.join(to, e.name);
+    if (e.isDirectory()) n += copyTree(a, b);
+    else if (e.isFile()) { fs.copyFileSync(a, b); n += 1; }
+  }
+  return n;
+};
+const restoreBackup = () => {
+  if (!fs.existsSync(HISTORY_BACKUP)) return 0;
+  let n = 0;
+  for (const e of fs.readdirSync(HISTORY_BACKUP, { withFileTypes: true })) {
+    if (!e.isDirectory() || !RUN_ID_RE.test(e.name)) continue;
+    copyTree(path.join(HISTORY_BACKUP, e.name), path.join(HISTORY_DIR, e.name));
+    n += 1;
+  }
+  return n;
+};
+const cleanupHistory = async () => {
+  // 1) 先把备份还原回去（越早越好），备份文件先留着，复核通过再删
+  if (fs.existsSync(HISTORY_BACKUP)) {
+    restoreBackup();
+    console.log("已从 " + HISTORY_BACKUP + " 还原用户原有历史记录");
+  }
+  // 2) 删掉本次 ui_check 产生的全部记录（含前面几步手动标注落下的那条）
+  let removed = 0;
+  for (const rid of await historyRunIds()) {
+    if (preexistingRunIds.has(rid)) continue;
+    try { await httpJson("/api/history/" + encodeURIComponent(rid), { method: "DELETE" }); removed += 1; }
+    catch (e) { console.log("清理记录失败 " + rid + "：" + e.message); }
+  }
+  // 3) 本次 /api/sample 生成的源图（记录删掉后它就是孤儿文件了），只删自己造的那一个
+  if (createdUpload && fs.existsSync(createdUpload)) { try { fs.rmSync(createdUpload); } catch (e) { /* 留着也无害 */ } }
+  // 4) 复核：用户原有记录一条不少 + total 回到开跑前的值
+  const now = await historyRunIds();
+  const missing = [...preexistingRunIds].filter((r) => !now.includes(r));
+  check("收尾：用户原有的历史记录一条不少", missing.length === 0,
+    "开跑前 " + preexistingRunIds.size + " 条，收尾 " + now.length + " 条，缺失 " + (missing.join(",") || "无") +
+    "（本次清掉 " + removed + " 条自检产物）");
+  const total = (await httpJson("/api/history?limit=1")).total;
+  check("收尾：GET /api/history 的 total 回到开跑前的值", total === preexistingRunIds.size,
+    total + " / " + preexistingRunIds.size);
+  if (!missing.length && fs.existsSync(HISTORY_BACKUP)) fs.rmSync(HISTORY_BACKUP, { recursive: true, force: true });
+  else if (missing.length) console.log("⚠ 备份仍保留在 " + HISTORY_BACKUP + "，请人工还原");
+};
+
+try {
+  // ---- 13.1 懒加载：刚打开页面时一次 /api/history 都不该请求 ----
+  const requests = [];
+  const recordRequest = (r) => requests.push(r.method() + " " + r.url());
+  page.on("request", recordRequest);
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForSelector("#sampleGroups button", { timeout: 15000 });
+  const historyHitsAtBoot = requests.filter((u) => u.indexOf("/api/history") >= 0);
+  check("历史面板懒加载：页面刚加载完不请求 /api/history", historyHitsAtBoot.length === 0,
+    historyHitsAtBoot.join(" | ") || "0 条");
+
+  // ---- 13.2 备份 → 清空全部 → 空态（验完立即在收尾还原）----
+  // 上一次中断留下的备份先还原，避免把它盖掉
+  if (fs.existsSync(HISTORY_BACKUP)) { restoreBackup(); console.log("发现上次中断留下的备份，已先还原"); }
+  const beforeClear = await historyRunIds();
+  fs.mkdirSync(HISTORY_DIR, { recursive: true });
+  fs.rmSync(HISTORY_BACKUP, { recursive: true, force: true });
+  for (const rid of beforeClear) copyTree(path.join(HISTORY_DIR, rid), path.join(HISTORY_BACKUP, rid));
+  const backed = fs.readdirSync(HISTORY_BACKUP).filter((n) => RUN_ID_RE.test(n)).length;
+  check("清空前已把 runs/history/ 整目录备份（可原样还原）", backed === beforeClear.length,
+    "备份 " + backed + " 条 / 现网 " + beforeClear.length + " 条");
+
+  await page.click("#tabHistory");
+  const listed = await waitSoft(() => document.querySelectorAll("#historyList .history-item").length > 0, null, 8000);
+  check("切到历史 Tab 才拉列表（懒加载生效）", listed && (await cardCount()) === beforeClear.length,
+    "卡片 " + (await cardCount()) + " 张 / 服务端 " + beforeClear.length + " 条");
+
+  page.once("dialog", (d) => d.accept());          // 「清空全部」有二次确认
+  await page.click("#btnHistoryClear");
+  await waitSoft(() => document.querySelectorAll("#historyList .history-item").length === 0, null, 8000);
+  const empty = await page.evaluate(() => ({
+    emptyVisible: !document.getElementById("historyEmpty").hidden,
+    cards: document.querySelectorAll("#historyList .history-item").length,
+    count: document.getElementById("historyCount").textContent,
+    text: document.getElementById("historyEmpty").textContent.trim(),
+  }));
+  const totalAfterClear = (await httpJson("/api/history?limit=1")).total;
+  check("清空历史后：空态可见、列表无卡片、服务端 total=0",
+    empty.emptyVisible && empty.cards === 0 && totalAfterClear === 0,
+    JSON.stringify(empty) + " 服务端 total=" + totalAfterClear);
+
+  // ---- 13.3 造 2 条记录（离线：POST /api/sample + POST /api/annotate，不调模型）----
+  const sample = await httpJson("/api/sample", { method: "POST" });
+  const imageId = sample.image.id;
+  createdUpload = path.join("runs", "uploads", imageId + ".png");
+  const annotate = async (items, prompt) => httpJson("/api/annotate", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image_id: imageId, items: items, prompt: prompt }),
+  });
+  const recA = await annotate([
+    { bbox_2d: [0.10, 0.10, 0.30, 0.30], label: "甲" },
+    { bbox_2d: [0.40, 0.40, 0.60, 0.60], label: "乙" },
+    { point_2d: [0.80, 0.20], label: "丙" },
+  ], "历史面板自检 A <b>注入尝试</b>");
+  const recB = await annotate([{ bbox_2d: [0.20, 0.20, 0.50, 0.50], label: "独苗" }], "历史面板自检 B");
+  createdRunIds.push(recA.run_id, recB.run_id);
+
+  await page.click("#btnHistoryRefresh");
+  await waitSoft(() => document.querySelectorAll("#historyList .history-item").length === 2, null, 8000);
+  // 缩略图是 loading="lazy" 的：先把面板滚进视口，再等两张图真的解码完。
+  // 不等就量 naturalWidth 只会读到 0 —— 那会把下面那条断言变成假失败（不是实现的问题）。
+  await page.locator("#panelHistory").scrollIntoViewIfNeeded();
+  await waitSoft(() => {
+    const imgs = [...document.querySelectorAll("#historyList .history-item img")];
+    return imgs.length === 2 && imgs.every((im) => im.complete && im.naturalWidth > 0);
+  }, null, 12000);
+  const cards = await page.evaluate(() => [...document.querySelectorAll("#historyList .history-item")].map((c) => {
+    const im = c.querySelector("img");
+    return {
+      run: c.dataset.runId,
+      src: im ? im.getAttribute("src") : null,
+      lazy: im ? im.getAttribute("loading") : null,
+      naturalWidth: im ? im.naturalWidth : 0,
+      prompt: (c.querySelector(".history-prompt") || {}).textContent || "",
+      promptHtml: (c.querySelector(".history-prompt") || {}).innerHTML || "",
+      text: c.textContent.replace(/\s+/g, " ").trim(),
+    };
+  }));
+  const cardA = cards.find((c) => c.run === recA.run_id);
+  const cardB = cards.find((c) => c.run === recB.run_id);
+  check("刷新后列表出现 2 张卡片", cards.length === 2 && !!cardA && !!cardB,
+    "实际 " + cards.length + " 张：" + cards.map((c) => c.run).join(","));
+
+  const listA = (await httpJson("/api/history?limit=1000")).records.find((r) => r.run_id === recA.run_id);
+  const listB = (await httpJson("/api/history?limit=1000")).records.find((r) => r.run_id === recB.run_id);
+  check("卡片里显示的是 thumb_url 的图片（?w=160），不是原标注图",
+    !!cardA && cardA.src === listA.thumb_url && !!cardB && cardB.src === listB.thumb_url && cardA.lazy === "lazy",
+    "卡片A=" + (cardA && cardA.src) + " · 接口 thumb_url=" + (listA && listA.thumb_url) + " · loading=" + (cardA && cardA.lazy));
+
+  // 缩略图真的被缩小了：若把 annotated_url 直接填进列表，naturalWidth 会是原图宽度（900）
+  check("缩略图真的被缩到 160px 宽（偷懒直接填 annotated_url 会失败）",
+    cardA.naturalWidth === 160 && cardB.naturalWidth === 160,
+    "naturalWidth A=" + cardA.naturalWidth + " B=" + cardB.naturalWidth +
+    "（原标注图宽 " + listA.source.width + "）");
+  check("卡片上的提示词文本被 escapeHtml 转义（不产生真的 HTML 标签）",
+    cardA.prompt.indexOf("<b>注入尝试</b>") >= 0 && cardA.promptHtml.indexOf("<b>") < 0,
+    "textContent 含转义原文=" + (cardA.prompt.indexOf("<b>注入尝试</b>") >= 0) +
+    " · innerHTML 含真标签=" + (cardA.promptHtml.indexOf("<b>") >= 0));
+
+  // ---- 13.4 点「载入」= 回看，绝不能发起识别 ----
+  requests.length = 0;
+  await page.click('#historyList .history-item[data-run-id="' + recA.run_id + '"] [data-history-load]');
+  await waitSoft((rid) => {
+    const im = document.getElementById("sideBefore");
+    return !!im && im.complete && im.naturalWidth > 0 && (im.getAttribute("src") || "").indexOf(rid) >= 0;
+  }, recA.run_id, 10000);
+  const loadReqs = requests.slice();
+  const detectReqs = loadReqs.filter((u) => u.indexOf("/api/detect") >= 0);
+  const fetchedRec = loadReqs.filter((u) => u.indexOf("/api/history/" + recA.run_id) >= 0);
+  check("点「载入」不发起任何 /api/detect 请求（回看 ≠ 重新识别）", detectReqs.length === 0,
+    "本次点击共 " + loadReqs.length + " 条请求，其中 /api/detect " + detectReqs.length + " 条" +
+    (detectReqs.length ? "：" + detectReqs.join(" | ") : ""));
+  check("点「载入」确实取回了这条记录（防止上一条断言空过）", fetchedRec.length >= 2,
+    "命中 " + fetchedRec.length + " 条：" + fetchedRec.join(" | "));
+
+  // ---- 13.5 载入后对比区确实换成了这条记录的原图 / 标注图 / 目标数 ----
+  const shown = await page.evaluate(() => ({
+    before: document.getElementById("sideBefore").getAttribute("src"),
+    stackBefore: document.getElementById("stackBefore").getAttribute("src"),
+    after: ["sideAfter", "stackAfter"].map((id) => document.getElementById(id).getAttribute("src")),
+    meta: document.getElementById("viewerMeta").textContent,
+    status: document.getElementById("statusLine").textContent,
+    cancelDisabled: document.getElementById("btnCancel").disabled,
+    detectDisabled: document.getElementById("btnDetect").disabled,
+  }));
+  check("载入后对比区换成该记录的原图 + 标注图",
+    shown.before === listA.source_url && shown.stackBefore === listA.source_url &&
+    shown.after.indexOf(listA.annotated_url) >= 0,
+    "原图=" + shown.before + " · 标注层=" + JSON.stringify(shown.after) + " · 记录=" + listA.annotated_url);
+  const shownTotal = Number((shown.meta.match(/共\s*(\d+)/) || [])[1]);
+  check("载入后显示的目标数 == 该记录的 n_items", shownTotal === listA.n_items,
+    "页面「" + shown.meta + "」= " + shownTotal + " / 记录 n_items = " + listA.n_items);
+  check("载入后不处于「识别中」（取消按钮禁用、识别按钮可用）",
+    shown.cancelDisabled === true && shown.detectDisabled === false,
+    "btnCancel.disabled=" + shown.cancelDisabled + " btnDetect.disabled=" + shown.detectDisabled);
+  check("载入后状态行说明这是历史记录回看（含时间）",
+    /历史记录/.test(shown.status) && /回看/.test(shown.status),
+    shown.status);
+
+  // ---- 13.6 手动标注成功后历史列表自动更新（不用手点刷新）----
+  const idsBeforeAnnotate = new Set(await historyRunIds());
+  await page.click("#btnManualApply");
+  const autoAppeared = await waitSoft(() => document.querySelectorAll("#historyList .history-item").length >= 2, null, 12000);
+  const newIds = (await historyRunIds()).filter((r) => !idsBeforeAnnotate.has(r));
+  createdRunIds.push(...newIds);
+  check("手动标注成功后历史列表自动多一条（新记录不会看不见）",
+    autoAppeared && newIds.length === 1,
+    "新记录 " + (newIds.join(",") || "无") + " · 列表卡片 " + (await cardCount()) + " 张");
+
+  // ---- 13.7 原图已不在磁盘上（source_url 404）：给 warn 告警、不白屏、标注图照常显示 ----
+  // 记录还在、原件没了是可预期情形（gc / 手工删文件都会造成）。
+  // ⚠️ 必须**重开页面**再载入：同一个 src 上面已经成功加载过一次，浏览器直接用缓存，
+  // 不会再发请求、也就不会触发 error 事件 —— 不重开会得到一条假失败。
+  if (createdUpload) fs.rmSync(createdUpload, { force: true });     // 删掉自己造的源图，制造 404
+  const goneSource = await fetch(BASE + "/api/history/" + recA.run_id + "/source");
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForSelector("#sampleGroups button", { timeout: 15000 });
+  await page.click("#tabHistory");
+  await page.waitForSelector('#historyList .history-item[data-run-id="' + recA.run_id + '"]', { timeout: 10000 });
+  await page.click('#historyList .history-item[data-run-id="' + recA.run_id + '"] [data-history-load]');
+  const warnedSoft = await waitSoft(() => !document.getElementById("alertBar").hidden, null, 10000);
+  const survived = await page.evaluate(() => ({
+    alert: document.getElementById("alertBar").textContent.replace(/\s+/g, " "),
+    after: document.getElementById("sideAfter").getAttribute("src"),
+    meta: document.getElementById("viewerMeta").textContent,
+  }));
+  check("原图已从磁盘删掉时：给 warn 告警、标注图与坐标照常显示（不白屏不崩）",
+    goneSource.status === 404 && warnedSoft && /不在磁盘上/.test(survived.alert) &&
+    survived.after === listA.annotated_url && survived.meta.indexOf("共 " + listA.n_items) >= 0,
+    "source_url=HTTP " + goneSource.status + " · 告警「" + survived.alert.slice(0, 90) + "」· 标注层=" + survived.after +
+    " · " + survived.meta);
+
+  // ---- 13.8 删除单条：DOM 与 HTTP 双向复核 ----
+  const totalBeforeDelete = (await httpJson("/api/history?limit=1")).total;
+  const cardsBeforeDelete = await cardCount();
+  await page.click('#historyList .history-item[data-run-id="' + recB.run_id + '"] [data-history-del]');
+  await waitSoft((n) => document.querySelectorAll("#historyList .history-item").length === n, cardsBeforeDelete - 1, 8000);
+  const totalAfterDelete = (await httpJson("/api/history?limit=1")).total;
+  check("点「删除」后卡片少一张", (await cardCount()) === cardsBeforeDelete - 1,
+    cardsBeforeDelete + " -> " + (await cardCount()));
+  check("点「删除」服务端 total 真的少 1（HTTP 复核，不只看 DOM）",
+    totalAfterDelete === totalBeforeDelete - 1, totalBeforeDelete + " -> " + totalAfterDelete);
+  const goneResp = await fetch(BASE + "/api/history/" + recB.run_id);
+  check("被删记录的 GET /api/history/<run_id> 返回 404", goneResp.status === 404, "HTTP " + goneResp.status);
+
+  page.off("request", recordRequest);
+} catch (e) {
+  check("历史记录断言组未抛异常", false, String((e && e.stack) || e).split("\n").slice(0, 3).join(" / "));
+} finally {
+  await cleanupHistory();
+}
 
 // 上面第 10 步是故意请求一个不可达 URL 来验证告警条，浏览器必然记录一条
 // "Failed to load resource: 400"，那是被测行为本身，不算页面缺陷。
