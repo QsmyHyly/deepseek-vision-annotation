@@ -177,7 +177,7 @@ def _coerce(spec: Spec, raw: Any, *, origin: str) -> Any:
 # --------------------------------------------------------------------------- #
 def prefs_path() -> Path:
     """配置文件路径。**每次调用现取** config.PREFS_PATH，便于测试改指临时目录
-    （与 objloc/storage.py 动态读 config.RUNS_DIR 的约定一致）。
+    （与 objloc/storage/ 动态读 config.RUNS_DIR 的约定一致）。
     """
     from objloc import config
 

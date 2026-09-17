@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """历史记录 / 上传落盘 的离线自测：python tests/test_storage.py
 
-覆盖 objloc/storage.py（打标记录的唯一读写入口）与 web 层的上传校验，全程**不花 API**：
+覆盖 objloc/storage/（打标记录的唯一读写入口）与 web 层的上传校验，全程**不花 API**：
   1. run_id 同秒内不重复，且字典序 == 时间序
   2. 写 -> 列表 -> 读单条 -> 删 的完整 round-trip
   3. 模拟重启（重新加载模块、重新扫盘，不走任何内存缓存）后仍能读回全部记录

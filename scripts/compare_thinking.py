@@ -31,7 +31,7 @@ from objloc.config import PROJECT_ROOT, get_settings  # noqa: E402
 from objloc.parsing import normalize_to_unit  # noqa: E402
 from objloc.visualizer import image_to_data_url_from_source  # noqa: E402
 
-# 默认选 3 张自带真值、且难度递进的图（见 objloc/samples.py 的目录）
+# 默认选 3 张自带真值、且难度递进的图（见 objloc/samples/ 的目录）
 DEFAULT_SAMPLES = ["bench_01", "bench_02", "bench_03"]
 
 

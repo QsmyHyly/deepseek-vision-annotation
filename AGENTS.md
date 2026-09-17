@@ -11,8 +11,10 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 外加一套**合成图片打标准确率评测**，以及**思考模式开关**（网页勾选框 / CLI / 环境变量）。
 
 - 工作目录：`E:\QsmyHyly-Code-Study-Workspace\DeepSeek视觉项目\deepseek-vision-annotation`
-  - 本仓库已从原先的扁平位置搬进容器目录 `DeepSeek视觉项目\`，**与它并列的 `new-project\` 是
-    待开发的新项目，其定位就是「参考本项目」**；两个项目互为兄弟目录，新项目可直接读本仓库源码。
+  - 本仓库已从原先的扁平位置搬进容器目录 `DeepSeek视觉项目\`，**与它并列的 `qsmy-deepseek-locator\` 是
+    新项目（原名 `new-project\`，2026-09 改名）**，其定位就是「参考本项目」：把本仓库跑通的
+    坐标口径、提示词、解析与打标逻辑抽成一个可 `pip install` 的正式库。两个项目互为兄弟目录，
+    新项目可直接读本仓库源码。
   - ⚠️ 改路径时注意：本文件、README.md 目录树、以及下方第 5 节的命令里都写死了这个绝对路径，
     搬目录要一并改（改完跑 `python tests\test_docrefs.py` 确认引用没断）。
 - Python 3.11（Windows / PowerShell）
@@ -35,7 +37,7 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 - ✅ **坐标约定已切换为 0.0~1.0 相对比例**（见 4.3），实测 deepseek-flash 输出即符合，无需换算；
   **小数位数已放开**（不再限死 3~4 位，小目标才留得住相对大小；0~1000 档同样允许带小数）。
 - ✅ 网页内置 **17 张测试图**（基准几何图 / 分辨率扫描 / 圆点阵 / 文字阶梯 / 竖线带 / **网页截图**，
-  目录见 `objloc/samples.py`）：点选载入 → 识别 → **自动按真值算检出率、平均 IoU、标签准确率**，
+  目录见 `objloc/samples/`）：点选载入 → 识别 → **自动按真值算检出率、平均 IoU、标签准确率**，
   不用人眼判断（`GET /api/samples`、`POST /api/samples/{id}/load`、SSE 的 `annotated.accuracy`）。
   第 ⑤ 组「网页截图」是唯一一组图片由**真浏览器渲染**、真值由 **DOM `getBoundingClientRect()`** 给出的图，
   见 §7 的「网页截图组」。
@@ -112,13 +114,30 @@ objloc/                      ★核心包
   tool_schema.py             由函数签名 + Annotated 注解生成工具 JSON Schema
   visualizer.py              图像加载 + 标注绘制（bbox/point，跨平台中文字体）
   agent.py                   ★Agent 主循环：流式输出 + 工具执行 + collect_items
-  benchmark.py               ★合成图片生成 + IoU/匹配/准确率指标（纯逻辑）
-  samples.py                 ★内置测试图片目录（网页「测试图片」面板与探测脚本共用的唯一生成源）
+  benchmark/                 ★合成图片生成 + IoU/匹配/准确率指标（纯逻辑）
+    synth.py                 合成样本生成：已知答案的几何图 + 真值
+    metrics.py               几何命中判定 / 匹配 / 指标聚合 / 坐标空间诊断
+    labels.py                标签判定口径 + 词表（颜色 / 形状 / 文本别名）
+  samples/                   ★内置测试图片目录（网页「测试图片」面板与探测脚本共用的唯一生成源）
+    generators.py            生成器 1~4：纯 Python 绘制的内置测试图 + 真值
+    web_samples.py           生成器 5：真浏览器网页截图（真值来自 DOM）
+    catalog.py               目录定义 + 各组提示词 + 对外接口（登记与调度）
+  storage/                   ★打标历史记录的唯一读写入口（见 4.9）
+    paths.py                 目录与 run_id：路径解析、id 生成与形状校验
+    records.py               meta.json 的组装与原子写入
+    index.py                 现场扫盘读取（列表 / 单条 / 路径解析 / 反查）
+    retention.py             删除与保留策略（重试、HISTORY_MAX、孤儿 GC）
+    thumbs.py                缩略图 ?w=：现场缩放 + 内存 LRU（不落盘）
   tools/
     registry.py              ★工具框架：注册 / schema / 执行 / 上下文注入 / 异常回填
     builtin.py               内置工具集合
   web/
-    app.py                   FastAPI：图片管理 + SSE 流式接口 + 静态页
+    app.py                   FastAPI 组装层：静态页 + 挂载下面 4 个 APIRouter（本身不含具体路由）
+    state.py                 进程内共享状态（IMAGES / REGISTRY）
+    settings_api.py          用户偏好路由（/api/settings 三个接口，见 4.10）
+    images.py                图片登记与图片资源路由（上传 / 取回 / 内置测试图 / 示例图）
+    history_api.py           历史记录路由（列表 / 单条 / 删 / 清空 / GC / 图，见 4.9）
+    detect_api.py            识别与标注路由（SSE 流式 / 本地标注）
     static/index.html        ★打标前后对比页面（原生 JS）
 scripts/
   benchmark.py               ★打标准确率评测 CLI（生成图片 + 调模型 + 出报告）
@@ -199,7 +218,7 @@ runs/                        运行产物；**根目录只放子目录与日志�
   | 系统提示词 | ✅ 给出换算公式 + 禁止像素值 | `config.py: DEFAULT_SYSTEM_PROMPT` |
   | 模型可调用的工具（解析 / 标注） | ✅ 工具层统一 | `tools/builtin.py: _unitize()` |
   | 纯解析核心 | ❌ 刻意保持原样 | `parsing.py`（探针依赖） |
-  | 网页 SSE 最终链路、手动标注 | ✅ | `web/app.py` → `normalize_to_unit()` |
+  | 网页 SSE 最终链路、手动标注 | ✅ | `web/detect_api.py` → `normalize_to_unit()` |
   | 画标注图 | ✅ 内部再兜底一次 | `visualizer.py: annotate()` |
 
 - **为什么是 0~1（来历，便于对外讲清楚）**：归一化坐标不是检测圈发明的，它出身于计算机图形学的
@@ -232,11 +251,11 @@ runs/                        运行产物；**根目录只放子目录与日志�
 要点：给换算公式、禁像素值、讲清"看不到真实分辨率"、"感知值本就是归一化数据"、点破 0~1 / 0~1000 的刻度不确定
 并给出确定的 0~1 输出契约，最后放开小数位数（见 4.3 的【精度】段）。
 ⚠️ 网页左栏「识别参数 → 提示词」输入框是 **user 消息**（`/api/detect` 的 `prompt` 字段），
-**不是**系统提示词——界面上改不动坐标口径，这是刻意的（`web/app.py: build_messages(prompt, image=...)` 不传 `system_prompt`）。
+**不是**系统提示词——界面上改不动坐标口径，这是刻意的（`web/detect_api.py: build_messages(prompt, image=...)` 不传 `system_prompt`）。
 
 - **它是全项目唯一的坐标口径来源**：网页 / CLI / 评测 / 内置测试图共用一个 system 消息
   （`objloc/agent.py: build_messages` 取 `Settings.system_prompt`），要改口径**只改这一处**，
-  别在 `objloc/samples.py` 的各条任务提示词里再抄一份——那些提示词只描述"找什么"，不描述"坐标怎么给"。
+  别在 `objloc/samples/` 的各条任务提示词里再抄一份——那些提示词只描述"找什么"，不描述"坐标怎么给"。
 - **工具描述只有首行会进模型**：schema 由 `objloc/tool_schema.py: build_tool` 取 docstring 的
   `splitlines()[0]`，所以**面向模型的约束必须写在首行**，下面的正文是给人看的
   （`get_image_info` 就吃过这个亏：警告写在第二段，模型根本读不到）。
@@ -356,7 +375,7 @@ DeepSeek 默认先输出思维链（`reasoning_content`）再给正文。本项�
 ```
 runs/
   uploads/        源图。统一转成 PNG，文件名 <image_id>.png（原始文件名记在 meta 里）
-  samples/        内置测试图（objloc/samples.py 现场生成，见 §7）
+  samples/        内置测试图（objloc/samples/ 现场生成，见 §7）
   web_samples/    网页截图组（scripts/capture_web_samples.mjs 产出，见 §7）
   scratch/        ★ 无归属的临时标注图：CLI detect、模型自己调的 annotate_image 工具落这里
   history/        ★ 唯一的持久化入口：每次打标一条记录
@@ -403,7 +422,7 @@ runs/
 }
 ```
 
-**HTTP 接口**（`objloc/web/app.py`）。列表**不带 `items`**（一次几十条会撑爆响应），单条才带全文：
+**HTTP 接口**（`objloc/web/history_api.py`）。列表**不带 `items`**（一次几十条会撑爆响应），单条才带全文：
 
 ```
 GET    /api/history?limit=50&offset=0&q=<子串>   列表，按 created_at 倒序
@@ -426,7 +445,7 @@ GET    /api/history/{run_id}/source              源图
   验收必须包含**重启服务再查**这一步，只在进程内跑通不算数。
 - **保留策略**：`HISTORY_MAX`（默认 200，`0` = 不限），每次新增记录后按 `run_id` 删最老的。
   这是防「只增不减」的闸门 —— 原来根目录 162 张散图就是这么攒出来的。
-- ⚠️ **删除必须"删不掉就如实说"**（`storage.py: _rmtree_retry()`，2026-09）。Windows 上一次性删二十来条
+- ⚠️ **删除必须"删不掉就如实说"**（`objloc/storage/retention.py: _rmtree_retry()`，2026-09）。Windows 上一次性删二十来条
   记录时，偶发有几条 `shutil.rmtree` 抛 WinError 32（文件正被杀软扫描 / 被索引器或读句柄占着）。
   原先是 `except OSError: pass`，于是**接口回 200、界面写"已清空 22 条"，盘上却剩 5 条**；
   `tests/ui/ui_check.mjs` 的历史组连着两次挂在这上面（77/80），第三次又自己好了 —— 典型的偶发。
@@ -514,7 +533,7 @@ CLI、评测脚本、以及 `/api/detect` 省略字段时的兜底值，用的�
 }
 ```
 
-**HTTP 接口**（`objloc/web/app.py`）：
+**HTTP 接口**（`objloc/web/settings_api.py`）：
 
 ```
 GET    /api/settings            当前生效值 / 来源(file|env|default) / 可选范围 / 警告
@@ -633,7 +652,7 @@ Start-Process python -ArgumentList '-m','objloc.web.app' -WorkingDirectory $root
    换模型/换服务商前先用 `scripts/compare_thinking.py` 或一次裸调验证，别假设通用。
 11. **本项目只能用 `deepseek-flash`（= DeepSeek-V4.1-Flash）**。官方只有两档模型，
    另一档 `deepseek-v4-pro` **不支持图像理解**——本项目全靠图片输入，换成它识别链路直接失效。
-   `objloc/web/app.py` 里那个按次覆盖模型的 `model` 参数只是逃生口，网页从不发送它。
+   `objloc/web/detect_api.py` 里那个按次覆盖模型的 `model` 参数只是逃生口，网页从不发送它。
    官方来源：<https://api-docs.deepseek.com/zh-cn/quick_start/pricing>
    @doc docs/DeepSeek-Models-and-Pricing.md#模型版本对应关系
 
@@ -641,7 +660,7 @@ Start-Process python -ArgumentList '-m','objloc.web.app' -WorkingDirectory $root
 
 ## 7. 打标准确率评测结论（重要）
 
-评测方式：`objloc/benchmark.py` 用代码生成「已知答案」的几何图形图片（随机颜色 × 形状 × 位置），
+评测方式：`objloc/benchmark/synth.py` 用代码生成「已知答案」的几何图形图片（随机颜色 × 形状 × 位置），
 把真值换算成 0.0~1.0 相对比例坐标，让真实模型打标，再按 IoU（阈值 0.5）匹配、按颜色/形状判定标签。
 指标定义：检测率 = 命中数 / 真值数；平均 IoU 仅在匹配对上统计。
 
@@ -675,7 +694,7 @@ python scripts\verify_gt.py runs\benchmark_v2_hard\images # 10 图 × 4 图形
 结果：**全部 55 个图形（15 + 40）边框误差 ≤ 1px**（外描边宽 5px、按中心线绘制，±3px 内属正常）。
 ⇒ 说明 GT 与绘制结果一致，之前 40% 的失败**不是 GT 的问题**，而是模型坐标空间的问题（见上表）。
 
-### 内置测试图的判定口径（`objloc/samples.py`）
+### 内置测试图的判定口径（`objloc/samples/`）
 
 五种图的真值生成方式不同，判定口径也不同，别混着看：
 
