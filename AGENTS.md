@@ -66,6 +66,9 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 - ✅ 未配置 Key 时自动降级为**离线 Mock**，保证零配置可演示。
 - ✅ 网页截图组实测（第 ⑤ 组，4 图 28 目标）：**检出率 100%、平均 IoU 0.856、标签准确率 97%**，
   关掉思考同样 100% 检出、耗时减半（详见第 7 节）。
+- ✅ **一键启动 + 页面内关闭服务**（2026-09-18，见 §4.11）：双击 `start-web.cmd` 起服务并开浏览器，
+  页面右上角「关闭服务」按钮（`POST /api/shutdown`，仅本机）把进程停掉 ——
+  服务是隐藏窗口拉起来的，没有控制台可按 Ctrl+C，这个按钮是唯一的出口。
 - ✅ 自测全绿：`tests/test_parser.py`、`tests/test_e2e.py`、`tests/test_benchmark.py`、`tests/test_docrefs.py`、
   `tests/test_web_samples.py`、`tests/test_storage.py`、`tests/test_userprefs.py`（均离线，不花 API）；
   另有前端回归自检 `tests/ui/`（id 双向校验 + 真实浏览器驱动页面），见 4.7。
@@ -110,6 +113,7 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 
 ```
 main.py                      CLI 入口（web / detect / tools / demo）
+start-web.cmd  start-web.ps1 一键启动网页服务：起服务 + 开浏览器（双击前者即可，见 §4.11）
 requirements.txt  .env.example  README.md  AGENTS.md
 config.local.json            用户偏好（网页「识别参数」保存的值；运行时生成，已 gitignore）
 docs/                        DeepSeek 官方 API 文档快照
@@ -162,6 +166,8 @@ tests/                       自测
   test_userprefs.py          用户偏好：优先级 / 校验 / 原子写 / 容错 的离线自测（见 4.10）
   test_web_samples.py        网页截图组：真值与 PNG 是否同源、能否被自动打分（见 §7）
                              纯离线，不花 API、也不需要服务在跑
+  probe_shutdown.py          「关闭服务」验收探针：真起进程验证能关掉 / 端口真的释放 /
+                             非本机来源 403（见 4.11）。占 8799 端口，跑完自己收干净
   ui/                        前端回归自检（见 4.7）
     check_frontend_contract.py  id 双向校验（离线、不需要服务）
     ui_check.mjs                真实浏览器驱动页面，交互与几何断言（离线，但需要服务在跑）
@@ -593,13 +599,64 @@ DELETE /api/settings[?keys=a,b] 删掉键 -> 回落到 环境变量 > 内置默�
 
 ---
 
+### 4.11 启动脚本与「关闭服务」（进程控制）
+
+**这两件东西是配套的，缺一个都不成立**：启动脚本把服务**用隐藏窗口**拉起来（没有控制台，
+所以按不到 Ctrl+C），因此必须再给一个能把它关掉的出口 —— 就是页面右上角那个按钮。
+
+**启动**：双击项目根的 `start-web.cmd`（薄壳，只负责用确定的解释器去跑）→ `start-web.ps1`。
+脚本按顺序做五件事，每一步的失败都**单独报出来**，不合成一句「启动失败」：
+
+1. **先探服务在不在**：在跑就直接开浏览器、**不重复起进程**（重复起会撞端口）。
+2. **找 python**；找不到就停在这里说清楚。
+3. **确认依赖库 qsmy_deepseek_locator 可用**：先探一次 import，探不通就把旁边的源码
+   `../qsmy-deepseek-locator/src` 挂上 `PYTHONPATH`（本机惯例是「源码在旁边、没 pip install」，
+   见 §5 的测试命令）；两边都没有就给出两种修法。
+   ⚠️ 这一步是**脚本真跑起来才发现要加的**：第一版没有它，表现是干等 60 秒后抛一句
+   `ModuleNotFoundError`，而那句话要翻到日志最底下才看得见。
+4. **刷新 `DEEPSEEK_API_KEY`**（读用户级环境变量）—— 已打开的终端读不到新设的变量，
+   不刷会**静默降级成离线 Mock**（§2 / §6.1）。没有 Key 时明确打印「将以离线 Mock 启动」。
+5. **端口占用就直接点名**：报出占用进程的 pid 与 `Stop-Process` 命令，而不是干等到超时。
+
+之后隐藏窗口起 `python -m objloc.web.app`，stdout/stderr 重定向到 `runs/web.out.log` /
+`runs/web.err.log`（**起服务前先清掉旧日志**，否则失败时打印的「最后 20 行」可能是一万年前的），
+每 400 ms 探一次 `/api/health`，最多 60 秒；就绪就开浏览器，超时就把两份日志的尾巴摊出来再退出。
+脚本自身**不装依赖、不改配置**。带 `-NoBrowser` 时不打开浏览器（只把服务拉起来），
+自动化与自检一律带它 —— 否则跑一次自检就弹一次浏览器，正在用电脑的人会被反复打断。
+
+**关闭**：`POST /api/shutdown`（`objloc/web/app.py`），页面右上角 `#btnShutdown` 走它。
+四条要记住的：
+
+- **只接受本机调用**（`request.client.host` ∈ 127.0.0.1 / ::1，不看任何可伪造的请求头），
+  否则 403。理由：`WEB_HOST` 可以配成 `0.0.0.0`，那种部署下不该让局域网里谁一个请求就把服务关掉。
+- **没有 Server 句柄时如实回 503**，不假装成功。句柄只有 `objloc.web.app: main()` 会挂
+  （它自己构造 `uvicorn.Server` 而不是调 `uvicorn.run`，因为后者不把实例交出来）。
+  用 `uvicorn` CLI 或 `TestClient` 起的进程没有这个句柄 —— 假回 200 的话前端会显示「已关闭」，
+  而进程其实还活着，人会一直等一个永远不会来的结果。
+- **先回响应、再退进程**：`threading.Timer(0.3, ...)` 里才置 `server.should_exit = True`，
+  立刻置的话响应可能还没写回，浏览器只会看到「连接被重置」。
+  前端因此把那句「连接被重置」**不当错误**：先探一次 `/api/health`，探不通就认定关闭成功。
+- 前端是**两段式确认**（点一次变「确认关闭？」，3 秒不点自动复位），**刻意不用 `window.confirm`**：
+  原生弹窗会挂住无头浏览器（`tests/ui/ui_check.mjs` 就跑在无头里）。
+
+验收（都实测过）：`python tests/probe_shutdown.py` 10/10 —— 真起一个进程，本机关得掉、
+进程真的退出、端口真的释放；再用 `WEB_HOST=0.0.0.0` + 局域网 IP 打过来确认 **403** 且服务还活着
+（负向对照）。分支断言在 `tests/test_e2e.py`（403 / 503 两条 + 「拒了之后 health 仍 200」）。
+
+---
+
 ## 5. 常用命令
 
 ```powershell
 cd 'E:\QsmyHyly-Code-Study-Workspace\DeepSeek视觉项目\deepseek-vision-annotation'
 
-# 启动网页（真实模型；确保当前会话有 DEEPSEEK_API_KEY）
+# 启动网页 —— 推荐双击项目根的 start-web.cmd（起服务 + 开浏览器，见 4.11）；
+# 它自己会找库、刷 API Key、等就绪，失败时摊出日志尾巴。
+# 等价的手工方式（真实模型；确保当前会话有 DEEPSEEK_API_KEY）：
 python main.py web                       # → http://127.0.0.1:8765
+
+# 关闭服务：网页右上角「关闭服务」按钮，或（仅本机可用）
+curl -X POST http://127.0.0.1:8765/api/shutdown
 
 # CLI 流式识别 + 出标注图
 python main.py detect --image "runs\uploads\xxx.png" --prompt "识别主要目标"
@@ -638,6 +695,9 @@ python tests\ui\check_frontend_contract.py   # id 双向校验：缺失 / 死元
 node tests\ui\ui_check.mjs                   # 真实浏览器驱动页面：对比几何 / 滑块 / 折叠 / 窄屏 / 告警
 node tests\ui\ui_check_detect.mjs            # 浏览器端真实 SSE 全链路
 python tests\ui\smoke_detect.py              # HTTP 层 SSE 冒烟
+
+# 「关闭服务」验收：真起一个进程，验证能关掉 / 端口真的释放 / 非本机来源 403（占 8799，见 4.11）
+python tests\probe_shutdown.py
 ```
 
 **后台重启服务的标准姿势**（注意刷新环境变量）：

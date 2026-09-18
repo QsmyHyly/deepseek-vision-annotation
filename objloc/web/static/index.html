@@ -702,6 +702,11 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
   <div class="topbar-badges">
     <span class="badge" id="providerBadge" title="模型服务状态">检测中…</span>
     <span class="badge" id="toolsBadge" title="后端已注册的工具">工具 —</span>
+    <!-- 关掉后端 python 进程。服务通常是 start-web.cmd 用**隐藏窗口**拉起来的，
+         没有控制台可以按 Ctrl+C —— 关掉浏览器后进程还占着端口，这个按钮是那个出口。
+         两段式确认（再点一次）而不弹原生对话框，理由见脚本里的 onShutdownClick。 -->
+    <button class="btn tiny ghost" type="button" id="btnShutdown"
+            title="停止后端服务（重新启动：双击项目根目录的 start-web.cmd）">⏻ 关闭服务</button>
   </div>
 </header>
 
@@ -2322,6 +2327,78 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
       renderPrefs();
     }
   }
+  /* ======================================================================
+   * 7b. 关闭后端服务（进程控制）
+   * ======================================================================
+   * 服务通常由 start-web.ps1 用**隐藏窗口**拉起来，没有控制台可以按 Ctrl+C：
+   * 用户关掉页面之后 python 进程还挂着占端口，下次启动就撞"端口已被占用"。
+   * 这个按钮就是那件事的出口。后端只接受**本机**调用（见 objloc/web/app.py: shutdown）。
+   */
+  let shutdownArmTimer = 0;
+
+  function resetShutdownButton() {
+    const btn = $("btnShutdown");
+    btn.textContent = "⏻ 关闭服务";
+    btn.classList.remove("danger");
+  }
+
+  // 两段式确认（点一次变"确认关闭？"，再点才真关），**不用 window.confirm**：
+  // 原生弹窗在无头浏览器里会把整个驱动挂住（前端自检 ui_check.mjs 就跑在无头里），
+  // 而且它跟页面长得完全两回事、位置也不受控。3 秒不点自动复位，免得留下一个"已上膛"的按钮。
+  function onShutdownClick() {
+    const btn = $("btnShutdown");
+    if (btn.dataset.armed === "1") {
+      btn.dataset.armed = "";
+      clearTimeout(shutdownArmTimer);
+      btn.disabled = true;
+      doShutdown();
+      return;
+    }
+    btn.dataset.armed = "1";
+    btn.textContent = "确认关闭？";
+    btn.classList.add("danger");
+    setStatus("再点一次「确认关闭？」就会停掉后端服务（识别与历史记录随之不可用）。", "warn");
+    clearTimeout(shutdownArmTimer);
+    shutdownArmTimer = setTimeout(() => {
+      if (btn.dataset.armed === "1") { btn.dataset.armed = ""; resetShutdownButton(); setStatus("就绪。"); }
+    }, 3000);
+  }
+
+  async function doShutdown() {
+    const btn = $("btnShutdown");
+    setStatus("正在关闭后端服务…", "busy");
+    const closed = () => {
+      btn.textContent = "服务已关闭";
+      pushAlert("info", "后端服务已关闭。重新启动请双击项目根目录的 start-web.cmd（或运行 python main.py web）。");
+      setStatus("后端服务已关闭，可以关掉这个页面了。", "warn");
+    };
+    try {
+      const resp = await fetch("/api/shutdown", { method: "POST" });
+      if (!resp.ok) throw new Error(await readError(resp));
+      closed();
+    } catch (e) {
+      // ⚠️ 关**成功**时也可能走到这里：服务在响应写回之前就退了，浏览器看到的是"连接被重置"。
+      // 那种情况不是错误，别报成失败吓人。用一次健康检查来分辨 —— 探不通 = 真的关了。
+      if (await serverAlive()) {
+        pushAlert("error", "关闭服务失败：" + e.message);
+        setStatus("关闭服务失败：" + e.message, "error");
+        btn.disabled = false;
+        resetShutdownButton();
+      } else {
+        closed();
+      }
+    }
+  }
+
+  async function serverAlive() {
+    try {
+      const resp = await fetch("/api/health", { cache: "no-store" });
+      return resp.ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
   async function resetPrefs() {
     state.prefs.saving = true;
     renderPrefs();
@@ -2544,6 +2621,7 @@ measureFitRatio(k) 的入参必须是"当前屏幕上生效的 k"，因为 rect 
     // 提示词用 change（失焦才触发）而不是 input：逐字上报会把文件写爆，也没人想每敲一个字存一次盘
     $("prompt").addEventListener("change", (e) => savePrefs({ prompt: e.target.value }));
     $("btnPrefsReset").addEventListener("click", resetPrefs);
+    $("btnShutdown").addEventListener("click", onShutdownClick);
     $("prompt").addEventListener("keydown", (e) => {
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); startDetect(); }
     });

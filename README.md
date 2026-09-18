@@ -134,6 +134,14 @@ node   tests/ui/ui_check.mjs                 # 真实浏览器驱动页面：对
 
 ## 3. 快速开始
 
+**最省事的方式（Windows）**：双击项目根目录的 `start-web.cmd` —— 它会自己找依赖库、
+刷新 API Key、把服务拉起来、等就绪后打开浏览器；失败时把日志尾巴摊出来告诉你卡在哪一步。
+
+**关闭服务**：点页面**右上角的「关闭服务」按钮**。服务是隐藏窗口拉起来的，没有控制台可以按
+Ctrl+C，所以那个按钮是正常的出口（只接受本机调用，见 AGENTS.md §4.11）。
+
+下面是不用脚本时的手工方式：
+
 ```bash
 pip install -r requirements.txt
 
@@ -251,6 +259,7 @@ python scripts/report.py runs/benchmark/report.json
 | GET | `/` | 对比查看页面 |
 | GET | `/api/health` | 运行状态（provider / 工具列表） |
 | GET | `/api/tools` | 已注册工具清单 |
+| POST | `/api/shutdown` | **关闭服务**（页面右上角按钮走它；**仅限本机**，否则 403） |
 | GET | `/api/settings` | 用户偏好当前值 / 来源（`file`\|`env`\|`default`）/ 可选范围 / 警告 |
 | PATCH | `/api/settings` | 按 key 部分更新（非法值 400，且**一项都不写**） |
 | DELETE | `/api/settings[?keys=a,b]` | 删掉偏好键 → 回落到环境变量 / 内置默认；省略 `keys` 为全部重置 |

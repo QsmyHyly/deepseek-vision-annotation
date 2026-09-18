@@ -620,6 +620,11 @@ await page.waitForTimeout(300);
 
 const HISTORY_DIR = path.join("runs", "history");
 const HISTORY_BACKUP = path.join("runs", "ui", "history_backup");
+// 前端一次只拉一页（index.html: fetch("/api/history?limit=" + HISTORY_PAGE)），
+// 所以「页面上的卡片数」的天花板是 min(服务端条数, 每页条数)，**不是**服务端条数本身。
+// 下面那条断言原先直接拿服务端条数比，一直绿只是因为记录数还没超过 50 条；
+// 2026-09-18 攒到 73 条就红了，而页面其实完全正常 —— 是断言把「每页 50 条」当成了「全部」。
+const HISTORY_PAGE = 50;
 const createdRunIds = [];        // 本组造出来的记录（收尾必删）
 let createdUpload = null;       // 本组 /api/sample 落下的源图文件（收尾一并清掉）
 const waitSoft = async (fn, arg, timeout = 8000) => {
@@ -702,8 +707,10 @@ try {
 
   await page.click("#tabHistory");
   const listed = await waitSoft(() => document.querySelectorAll("#historyList .history-item").length > 0, null, 8000);
-  check("切到历史 Tab 才拉列表（懒加载生效）", listed && (await cardCount()) === beforeClear.length,
-    "卡片 " + (await cardCount()) + " 张 / 服务端 " + beforeClear.length + " 条");
+  const expectCards = Math.min(beforeClear.length, HISTORY_PAGE);
+  check("切到历史 Tab 才拉列表（懒加载生效）", listed && (await cardCount()) === expectCards,
+    "卡片 " + (await cardCount()) + " 张 / 期望 " + expectCards + " 张（服务端 " + beforeClear.length +
+      " 条，每页 " + HISTORY_PAGE + "）");
 
   page.once("dialog", (d) => d.accept());          // 「清空全部」有二次确认
   await page.click("#btnHistoryClear");

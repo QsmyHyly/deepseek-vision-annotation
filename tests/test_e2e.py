@@ -113,6 +113,22 @@ check("GET /api/health", r.status_code == 200 and r.json()["provider"] == "mock"
 r = client.get("/api/tools")
 check("GET /api/tools", r.status_code == 200 and len(r.json()["tools"]) >= 5, r.text[:200])
 
+# 「关闭服务」接口有两道门，TestClient 恰好能分别触发（两道的**顺序**也顺带锁住了：
+# 安全门在本机判定之前，非本机来源连"有没有句柄"都不该知道）：
+#   ① 来源必须是本机 —— TestClient 默认的合成来源是字符串 "testclient"，会被拒；
+#   ② 过了本机之后还要有 uvicorn Server 句柄 —— 只有 objloc.web.app: main() 会挂它。
+r = client.post("/api/shutdown")
+check("POST /api/shutdown 非本机来源 -> 403", r.status_code == 403, r.text[:160])
+
+_loopback = TestClient(app, client=("127.0.0.1", 51234))
+r = _loopback.post("/api/shutdown")
+# 这里必须是 503，不能是 200：假装已关闭的话前端会显示"服务已关闭"，
+# 而进程其实还活着，人会一直等一个永远不会发生的结果。
+check("POST /api/shutdown 本机但无 Server 句柄 -> 503", r.status_code == 503, r.text[:200])
+# 负向对照：两道门都拒了之后，服务必须还是**好的**。
+# 少了这条，一个"所有请求都回错误码"的坏实现也能过上面两条。
+check("拒绝关机后 /api/health 仍然 200", client.get("/api/health").status_code == 200)
+
 r = client.get("/")
 check("GET /", r.status_code == 200 and "对比" in r.text, r.status_code)
 
