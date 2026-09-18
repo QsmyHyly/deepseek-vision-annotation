@@ -1,4 +1,4 @@
-# DeepSeek 物体定位 · 打标对比演示台 —— 网页服务启动器
+﻿# DeepSeek 物体定位 · 打标对比演示台 —— 网页服务启动器
 #
 # 写法参考 ~/.dsh/desktop-launcher/start-dsh-web.cmd + launcher.ps1：
 # 先探一下服务在不在 -> 在就直接开浏览器（不重复起进程）；不在就拉起来、等到就绪再开浏览器。

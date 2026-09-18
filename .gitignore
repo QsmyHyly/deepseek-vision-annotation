@@ -45,3 +45,7 @@ desktop.ini
 *.tmp
 *.bak
 *.orig
+
+# 快捷方式（install-shortcut.ps1 的产物）。不提交是有意的：.lnk 里写死的是
+# 这台机器上的绝对路径，换台机器/换个目录就是坏链接 —— 提交生成器，不提交产物。
+*.lnk

@@ -134,8 +134,22 @@ node   tests/ui/ui_check.mjs                 # 真实浏览器驱动页面：对
 
 ## 3. 快速开始
 
-**最省事的方式（Windows）**：双击项目根目录的 `start-web.cmd` —— 它会自己找依赖库、
+**最省事的方式（Windows）**：双击项目根目录的 **`启动演示台.lnk`** —— 它会自己找依赖库、
 刷新 API Key、把服务拉起来、等就绪后打开浏览器；失败时把日志尾巴摊出来告诉你卡在哪一步。
+
+这个快捷方式由 `install-shortcut.ps1` 生成（仓库不提交 `.lnk`，里面写死的是本机绝对路径），
+换台机器或换了目录就重新生成一次：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1 -Desktop   # 桌面也放一个
+```
+
+⚠️ **为什么不让你直接双击 `start-web.ps1`**：`.ps1` 在本机关联到了 VSCode，双击只会打开编辑器。
+`.lnk` 不受文件关联影响，双击就是用写好的目标去启动。同理 `main.py` 是命令行工具，
+不给参数只会打印用法 —— 那是正常的，不是坏了。
+
+想跳过快捷方式也行，直接双击 `start-web.cmd` 效果一样。
 
 **关闭服务**：点页面**右上角的「关闭服务」按钮**。服务是隐藏窗口拉起来的，没有控制台可以按
 Ctrl+C，所以那个按钮是正常的出口（只接受本机调用，见 AGENTS.md §4.11）。

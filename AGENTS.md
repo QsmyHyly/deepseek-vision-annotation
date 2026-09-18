@@ -66,7 +66,8 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 - ✅ 未配置 Key 时自动降级为**离线 Mock**，保证零配置可演示。
 - ✅ 网页截图组实测（第 ⑤ 组，4 图 28 目标）：**检出率 100%、平均 IoU 0.856、标签准确率 97%**，
   关掉思考同样 100% 检出、耗时减半（详见第 7 节）。
-- ✅ **一键启动 + 页面内关闭服务**（2026-09-18，见 §4.11）：双击 `start-web.cmd` 起服务并开浏览器，
+- ✅ **一键启动 + 快捷方式 + 页面内关闭服务**（2026-09-18，见 §4.11）：双击 `启动演示台.lnk`
+  （由 `install-shortcut.ps1` 生成，避开 `.ps1` 关联到 VSCode 的问题）或 `start-web.cmd` 起服务并开浏览器，
   页面右上角「关闭服务」按钮（`POST /api/shutdown`，仅本机）把进程停掉 ——
   服务是隐藏窗口拉起来的，没有控制台可按 Ctrl+C，这个按钮是唯一的出口。
 - ✅ 自测全绿：`tests/test_parser.py`、`tests/test_e2e.py`、`tests/test_benchmark.py`、`tests/test_docrefs.py`、
@@ -114,6 +115,7 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 ```
 main.py                      CLI 入口（web / detect / tools / demo）
 start-web.cmd  start-web.ps1 一键启动网页服务：起服务 + 开浏览器（双击前者即可，见 §4.11）
+install-shortcut.ps1         生成「启动演示台.lnk」快捷方式，绕开 .ps1 关联到 VSCode 的问题（见 §4.11）
 requirements.txt  .env.example  README.md  AGENTS.md
 config.local.json            用户偏好（网页「识别参数」保存的值；运行时生成，已 gitignore）
 docs/                        DeepSeek 官方 API 文档快照
@@ -166,6 +168,8 @@ tests/                       自测
   test_userprefs.py          用户偏好：优先级 / 校验 / 原子写 / 容错 的离线自测（见 4.10）
   test_web_samples.py        网页截图组：真值与 PNG 是否同源、能否被自动打分（见 §7）
                              纯离线，不花 API、也不需要服务在跑
+  test_launcher.py           启动脚本自测：.ps1 的 BOM / .cmd 的纯 ASCII / 用真的 PowerShell 5.1
+                             解析 / 快捷方式真能生成且目标正确（见 4.11，含负向对照）
   probe_shutdown.py          「关闭服务」验收探针：真起进程验证能关掉 / 端口真的释放 /
                              非本机来源 403（见 4.11）。占 8799 端口，跑完自己收干净
   ui/                        前端回归自检（见 4.7）
@@ -639,6 +643,37 @@ DELETE /api/settings[?keys=a,b] 删掉键 -> 回落到 环境变量 > 内置默�
 - 前端是**两段式确认**（点一次变「确认关闭？」，3 秒不点自动复位），**刻意不用 `window.confirm`**：
   原生弹窗会挂住无头浏览器（`tests/ui/ui_check.mjs` 就跑在无头里）。
 
+**快捷方式（避开文件关联）**：双击 `.ps1` 在本机关联到了 VSCode，会打开编辑器而不是运行；
+`main.py` 是 CLI，不给参数只会打印用法（这是对的，别去改它的默认行为）。所以本仓库带一个
+`install-shortcut.ps1`，跑一次就在项目根生成 `启动演示台.lnk`（加 `-Desktop` 再往桌面放一个）：
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1
+
+`.lnk` 是唯一不受文件关联影响的入口 —— 双击就是「用它写好的目标去启动」，没有中间商。
+生成物 `*.lnk` **不提交**（里面写死本机绝对路径，换台机器就是坏链接），提交的是生成器；
+这条写在 `.gitignore` 里。目标指向 `start-web.cmd`、工作目录设成项目根 ——
+与桌面上的 `DeepSeek-Harness.lnk` 同一套路（那个指向 `~/.dsh/desktop-launcher/start-dsh-web.cmd`）。
+
+⚠️ **两条编码约定，去掉任何一条双击就哑掉**（`tests/test_launcher.py` 钉死了）：
+
+| 文件 | 要求 | 为什么 |
+|---|---|---|
+| `*.cmd` | **纯 ASCII**，一个非 ASCII 字节都不许有 | cmd.exe 即使 `chcp 65001` 也会搞坏含 UTF-8 中文的批处理 |
+| `*.ps1` | **必须带 UTF-8 BOM** | 双击走的是 **Windows PowerShell 5.1**，它把无 BOM 的 `.ps1` 按系统 ANSI（中文 Windows 上是 GBK）解码，中文注释的字节被解坏、把引号吃掉，整份脚本报 `The string is missing the terminator` 直接解析失败 —— 表现为窗口一闪而过、浏览器不弹 |
+
+⚠️ **踩坑经过（务必读，因为「验证通过」本身会骗人）**：第一版 `start-web.ps1` 存成了**无 BOM**，
+而当时所有验证都是拿 **PowerShell 7（pwsh）** 跑的 —— PS7 默认按 UTF-8 读，永远是对的，
+于是脚本「验过了」但双击依然没反应。**验错了执行环境，等于没验。**
+现在 `tests/test_launcher.py` 直接拿**真正的 5.1**（`System32\WindowsPowerShell\v1.0\powershell.exe`）
+去解析，并配了负向对照：把 BOM 去掉之后必须报错。没有这条对照，这条断言在文件本来就有 BOM 时
+自动成立、坏了也可能蒙混过关。
+
+⚠️ **改 `.ps1` 之后必须重新补 BOM**：本仓库这套编辑工具的保存动作会把 BOM 抹掉 ——
+写这条测试的当天，同一个坑在两小时内又中了一次（改 `install-shortcut.ps1` 时），是测试当场抓住的。
+补 BOM 一行（幂等，可反复跑）：
+
+    python -c "import pathlib,sys; [p.write_text(p.read_text(encoding='utf-8-sig'),encoding='utf-8-sig') for p in map(pathlib.Path, sys.argv[1:])]" start-web.ps1 install-shortcut.ps1
+
 验收（都实测过）：`python tests/probe_shutdown.py` 10/10 —— 真起一个进程，本机关得掉、
 进程真的退出、端口真的释放；再用 `WEB_HOST=0.0.0.0` + 局域网 IP 打过来确认 **403** 且服务还活着
 （负向对照）。分支断言在 `tests/test_e2e.py`（403 / 503 两条 + 「拒了之后 health 仍 200」）。
@@ -650,10 +685,16 @@ DELETE /api/settings[?keys=a,b] 删掉键 -> 回落到 环境变量 > 内置默�
 ```powershell
 cd 'E:\QsmyHyly-Code-Study-Workspace\DeepSeek视觉项目\deepseek-vision-annotation'
 
-# 启动网页 —— 推荐双击项目根的 start-web.cmd（起服务 + 开浏览器，见 4.11）；
-# 它自己会找库、刷 API Key、等就绪，失败时摊出日志尾巴。
-# 等价的手工方式（真实模型；确保当前会话有 DEEPSEEK_API_KEY）：
+# 启动网页 —— 最省事的是双击项目根那个「启动演示台.lnk」快捷方式；
+# 没有它就用 powershell -File .\install-shortcut.ps1 生成一个（见 4.11，.ps1 双击会开 VSCode）。
+# 也可以直接双击 start-web.cmd，或控制台里跑：
 python main.py web                       # → http://127.0.0.1:8765
+
+# 生成快捷方式（.lnk 不受文件关联影响；-Desktop 同时在桌面放一个）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-shortcut.ps1
+
+# 只要服务、不要弹浏览器（自动化与自检一律用这个）
+.\start-web.cmd -NoBrowser
 
 # 关闭服务：网页右上角「关闭服务」按钮，或（仅本机可用）
 curl -X POST http://127.0.0.1:8765/api/shutdown
@@ -680,6 +721,7 @@ python -c "from objloc import samples; print(samples.list_catalog())"   # 看目
 python scripts\probe_vision_frame.py --self-test                       # 校验拟合数学，不花 API
 
 # 自测（不花 API）
+python tests\test_launcher.py   # 启动脚本：编码 / 5.1 解析 / 快捷方式（见 4.11）
 python tests\test_parser.py
 python tests\test_e2e.py
 python tests\test_benchmark.py
@@ -735,6 +777,11 @@ Start-Process python -ArgumentList '-m','objloc.web.app' -WorkingDirectory $root
    `objloc/web/detect_api.py` 里那个按次覆盖模型的 `model` 参数只是逃生口，网页从不发送它。
    官方来源：<https://api-docs.deepseek.com/zh-cn/quick_start/pricing>
    @doc docs/DeepSeek-Models-and-Pricing.md#模型版本对应关系
+12. **启动脚本的编码是硬约束，不是风格问题**（详见 4.11）：`*.cmd` 必须纯 ASCII、
+   `*.ps1` 必须带 UTF-8 BOM。少了 BOM，双击走 Windows PowerShell 5.1 会按 ANSI 解码、
+   报 `The string is missing the terminator` 直接不跑（窗口一闪而过、浏览器不弹）。
+   ⚠️ 而且**用 pwsh（PS7）验证测不出这个问题** —— PS7 默认按 UTF-8 读，永远是对的。
+   改完 `.ps1` 记得补 BOM，并跑 `python tests\test_launcher.py`。
 
 ---
 
