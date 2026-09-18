@@ -23,6 +23,14 @@ import ast
 import json
 from typing import Annotated
 
+# to_items 的规则本体在库的 qsmy_deepseek_locator.parsing（0.2.0 上游化），这里转出同名符号 ——
+# 本仓库的 objloc/visualizer.py 与 tests/test_parser.py 都按 objloc.parsing.to_items 引用它。
+# 为什么特别说明：这份实现原先在本仓库和库里各有一份，**长得像但语义不同** ——
+# 本仓库这份认「工具返回的成对列表」，库里那份（to_dict_items）只认 dict。
+# 上游化 collect_items 时带走了严格的那份，宽松分支留在本仓库没跟过去，
+# 于是工具模式下收集不到坐标（2026-09-18，两个仓库的 e2e 同时红）。现在只留库里的那一份。
+from qsmy_deepseek_locator.parsing import to_items  # noqa: F401
+
 # data 参数的 JSON schema（嵌套较深，抽为常量以保持函数签名简洁）
 _COORDINATE_LIST_SCHEMA = {
     "type": "array",
@@ -181,41 +189,9 @@ def parse_coordinates(text: Annotated[str, "包含坐标 JSON 的文本，可带
     return extract_coordinates(decode_json_points(text))
 
 
-def to_items(text_or_data) -> list:
-    """把文本 / parse_coordinates 结果统一转成坐标对象列表（便于标注）。
-
-    支持输入：
-    - 文本：先经 decode_json_points 解析；
-    - (bboxes, bbox_labels, points, point_labels) 四元组或等价的四列表；
-    - {"bboxes": ..., "bbox_labels": ..., "points": ..., "point_labels": ...} 字典；
-    - 单个坐标对象 / 坐标对象列表。
-    """
-    data = decode_json_points(text_or_data) if isinstance(text_or_data, str) else text_or_data
-    if isinstance(data, tuple):
-        data = list(data)
-
-    def _merge(bboxes, bbox_labels, points, point_labels):
-        merged = []
-        for bbox, label in zip(bboxes, bbox_labels):
-            merged.append({"bbox_2d": bbox, "label": label})
-        for point, label in zip(points, point_labels):
-            merged.append({"point_2d": point, "label": label})
-        return merged
-
-    keys = {"bboxes", "bbox_labels", "points", "point_labels"}
-    if isinstance(data, dict) and keys <= set(data):
-        return _merge(data["bboxes"], data["bbox_labels"], data["points"], data["point_labels"])
-
-    # extract_coordinates 返回的 (bboxes, bbox_labels, points, point_labels)
-    if (isinstance(data, list) and len(data) == 4
-            and all(isinstance(x, list) for x in data)):
-        return _merge(*data)
-
-    if isinstance(data, dict):
-        return [data]
-    if isinstance(data, list):
-        return [d for d in data if isinstance(d, dict)]
-    return []
+# to_items 的定义已上游进库，见文件头的 import（旧实现逐字搬到了
+# qsmy_deepseek_locator.parsing.to_items，并补上了「工具只回坐标不回标签时不要整批丢掉」
+# 的处理）。这里不再保留副本。
 
 
 # --------------------------------------------------------------------------- #
