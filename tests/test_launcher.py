@@ -208,6 +208,39 @@ check("Open-Browser 受 -NoBrowser 短路", "if ($NoBrowser)" in launcher)
 check("两份入口都调用 Open-Browser", launcher.count("Open-Browser") == 3,
       "应为 1 个函数定义 + 2 个调用点，实际 " + str(launcher.count("Open-Browser")))
 
+# ---------------------------------------------------------------- 8. requirements.txt 必须带 BOM
+# 与上面 .ps1 是**同一类坑**，只是读它的程序从 PowerShell 5.1 换成了 pip：
+# pip 的 auto_decode 先找 BOM，找不到就退回 locale.getpreferredencoding(False) ——
+# 简体中文 Windows 上是 GBK。于是 UTF-8 **无 BOM** 的 requirements.txt 只要含中文注释，
+# `pip install -r requirements.txt` 就抛 UnicodeDecodeError(gbk) 直接崩，一行依赖都装不上。
+# 这个坑 2026-09-18 才被发现：README 里那条手工安装路径**一直是坏的**，却没人知道 ——
+# 因为本机开发一律走 start-web.cmd（它把库源码挂上 PYTHONPATH），没人真去跑一次 pip install。
+# 又一次「兜底把坑盖住了」，和文件开头那条 .ps1 的教训同源。
+req = ROOT / "requirements.txt"
+check("requirements.txt 存在", req.exists())
+if req.exists():
+    raw = req.read_bytes()
+    check("requirements.txt 带 UTF-8 BOM（否则 pip 在中文 Windows 上按 GBK 读会崩）",
+          raw[:3] == PS51_BOM,
+          "前 3 字节是 " + " ".join(f"{b:02x}" for b in raw[:3]) + "，应为 ef bb bf")
+
+    # 负向对照：证明这条断言测的是 BOM 本身，而不是「这个文件恰好能读」。
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        probe = tmpdir / "req_nobom.txt"
+        probe.write_bytes(raw[3:] if raw[:3] == PS51_BOM else raw)  # 去掉 BOM，其余一字不动
+        check("负向对照：去掉 BOM 后不再被认作带 BOM", probe.read_bytes()[:3] != PS51_BOM)
+        probe.write_bytes(PS51_BOM + probe.read_bytes())           # 再原样加回去
+        check("对照：同一份内容加回 BOM 后又成立", probe.read_bytes()[:3] == PS51_BOM)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 顺带锁住依赖下限：写低了会装到缺 to_items 的 0.2.0，objloc.parsing 直接 ImportError
+    # （整个包 import 不了）。详见 AGENTS.md §0 与库仓 README §13。
+    check("qsmy-deepseek-locator 下限 >=0.2.1",
+          "qsmy-deepseek-locator>=0.2.1" in req.read_text(encoding="utf-8-sig"),
+          "写更低的下限会装到 PyPI 上缺 to_items 的 0.2.0")
+
 print()
 if FAILED:
     print("FAILED:", FAILED)

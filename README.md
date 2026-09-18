@@ -169,6 +169,13 @@ python main.py detect --image a.png --no-thinking   # 关闭思考模式（更�
 python main.py demo                        # 离线跑通流式 + 工具执行（Mock）
 ```
 
+⚠️ **这条依赖有下限要求**：`requirements.txt` 里写的是 `qsmy-deepseek-locator>=0.2.1`。**别降到 `0.2.0`** ——
+`parsing.to_items` 是在 0.2.0 **发布之后**才补进库的（版本号没跟着升），PyPI 上那份 0.2.0 里没有它，
+装上之后 `objloc.parsing` 直接 `ImportError`、整个服务起不来。本机没露馅，是因为启动脚本会把旁边的库源码
+挂上 `PYTHONPATH`（见 AGENTS.md §4.11）—— 那个兜底恰好把这个问题盖住了。
+顺带说清一个历史遗留：`0.1.3` 这个版本号**从来没有发布过**，它只是当时的工作标签，
+那批改动随 `0.2.0` 一起发出去的。
+
 未配置 `DEEPSEEK_API_KEY` 时自动进入**离线 Mock 模式**，仍可体验流式输出、工具执行与对比页面。
 
 **注意**：若你刚在系统里新增了环境变量，**需要新开终端**（已打开的会话读不到）。

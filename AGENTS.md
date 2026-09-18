@@ -24,6 +24,11 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
     **改这几处共用规则时改库**（`qsmy-deepseek-locator`），不要改本仓库的薄层 ——
     薄层里写的行为都由库决定。依赖方向没有反转：库仍然不 import 本仓库的任何东西。
     代价是本仓库多了一条 `qsmy-deepseek-locator` 依赖（见 `requirements.txt`）。
+    ⚠️ **下限必须 `>=0.2.1`**：`parsing.to_items` 是 0.2.0 **发布之后**才补进库的（版本号没跟着升），
+    PyPI 上那份 0.2.0 里没有它 —— 卡在 0.2.0、或写从没发布过的 `0.1.3`，都会让 `objloc.parsing` 直接
+    `ImportError`、整个包 import 不了。本机不装包、靠挂源码 `PYTHONPATH` 跑，所以这个坑**只对「按 README
+    装一遍」的人露出来**，而那是别人拿到这个仓库时的默认路径。
+    库仓有 `tools/check_release.py` 专门盯「已发布产物与源码是否同一份」，见库仓 README §13。
   - ⚠️ 测试这几个文件时要把库的源码加进 `PYTHONPATH`（本机未 pip install 该库）：
     `PYTHONPATH=<库>/src:. python tests/test_benchmark.py`。
   - ⚠️ 改路径时注意：本文件、README.md 目录树、以及下方第 5 节的命令里都写死了这个绝对路径，
@@ -654,12 +659,15 @@ DELETE /api/settings[?keys=a,b] 删掉键 -> 回落到 环境变量 > 内置默�
 这条写在 `.gitignore` 里。目标指向 `start-web.cmd`、工作目录设成项目根 ——
 与桌面上的 `DeepSeek-Harness.lnk` 同一套路（那个指向 `~/.dsh/desktop-launcher/start-dsh-web.cmd`）。
 
-⚠️ **两条编码约定，去掉任何一条双击就哑掉**（`tests/test_launcher.py` 钉死了）：
+⚠️ **三条编码约定，去掉任何一条就哑掉**（`tests/test_launcher.py` 钉死了，每条都配了负向对照）：
 
 | 文件 | 要求 | 为什么 |
 |---|---|---|
 | `*.cmd` | **纯 ASCII**，一个非 ASCII 字节都不许有 | cmd.exe 即使 `chcp 65001` 也会搞坏含 UTF-8 中文的批处理 |
 | `*.ps1` | **必须带 UTF-8 BOM** | 双击走的是 **Windows PowerShell 5.1**，它把无 BOM 的 `.ps1` 按系统 ANSI（中文 Windows 上是 GBK）解码，中文注释的字节被解坏、把引号吃掉，整份脚本报 `The string is missing the terminator` 直接解析失败 —— 表现为窗口一闪而过、浏览器不弹 |
+| `requirements.txt` | **必须带 UTF-8 BOM** | 读它的是 **pip**：`auto_decode` 找不到 BOM 就退回 `locale.getpreferredencoding()`（中文 Windows 上是 GBK）。只要文件里有中文注释，`pip install -r requirements.txt` 就抛 `UnicodeDecodeError` 直接崩，**一行依赖都装不上**。这是 2026-09-18 才发现的**老坑**：README 那条手工安装路径一直是坏的，因为本机一律走 `start-web.cmd`（它挂源码 `PYTHONPATH`），没人真去跑过一次 `pip install` —— 又一次「兜底把坑盖住了」 |
+
+⚠️ 这三条都归 `tests/test_launcher.py` 管，且每条都配了负向对照（把 BOM 去掉 / 塞入非 ASCII 字节之后必须报错）。
 
 ⚠️ **踩坑经过（务必读，因为「验证通过」本身会骗人）**：第一版 `start-web.ps1` 存成了**无 BOM**，
 而当时所有验证都是拿 **PowerShell 7（pwsh）** 跑的 —— PS7 默认按 UTF-8 读，永远是对的，
@@ -782,6 +790,9 @@ Start-Process python -ArgumentList '-m','objloc.web.app' -WorkingDirectory $root
    报 `The string is missing the terminator` 直接不跑（窗口一闪而过、浏览器不弹）。
    ⚠️ 而且**用 pwsh（PS7）验证测不出这个问题** —— PS7 默认按 UTF-8 读，永远是对的。
    改完 `.ps1` 记得补 BOM，并跑 `python tests\test_launcher.py`。
+   同一条规矩还有 **`requirements.txt`**：读它的是 pip，`auto_decode` 找不到 BOM 就按系统 ANSI
+   （GBK）解码，文件里只要有中文注释，`pip install -r requirements.txt` 就抛 `UnicodeDecodeError`
+   直接崩 —— 这是 2026-09-18 才发现的**老坑**，那条手工安装路径一直是坏的。
 
 ---
 

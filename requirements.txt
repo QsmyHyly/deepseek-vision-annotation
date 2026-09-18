@@ -1,5 +1,9 @@
-# 核心依赖
-qsmy-deepseek-locator>=0.1.3   # thinking 合并规则等跨项目共用件的来源（见 objloc/providers.py）
+﻿# 核心依赖
+# 下限必须 >=0.2.1：0.1.3 **从来没有发布过**（那只是当时的工作标签，改动随 0.2.0 发出），
+# 而 0.2.0 发布之后补进来的 parsing.to_items 一直没进过任何已发布产物 —— 卡在 0.2.0
+# 会 `from qsmy_deepseek_locator.parsing import to_items` 直接 ImportError，整个包 import 不了。
+# 详见库仓 README §13 与它的 tools/check_release.py。
+qsmy-deepseek-locator>=0.2.1   # thinking 合并规则等跨项目共用件的来源（见 objloc/providers.py）
 openai>=1.0            # DeepSeek 使用 OpenAI 兼容协议
 requests>=2.31         # 下载图片
 Pillow>=10.0           # 图像加载与标注绘制
