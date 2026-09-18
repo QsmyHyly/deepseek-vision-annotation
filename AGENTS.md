@@ -12,9 +12,20 @@ DeepSeek 多模态「**物体定位 + 打标**」演示软件：**流式输出**
 
 - 工作目录：`E:\QsmyHyly-Code-Study-Workspace\DeepSeek视觉项目\deepseek-vision-annotation`
   - 本仓库已从原先的扁平位置搬进容器目录 `DeepSeek视觉项目\`，**与它并列的 `qsmy-deepseek-locator\` 是
-    新项目（原名 `new-project\`，2026-09 改名）**，其定位就是「参考本项目」：把本仓库跑通的
-    坐标口径、提示词、解析与打标逻辑抽成一个可 `pip install` 的正式库。两个项目互为兄弟目录，
-    新项目可直接读本仓库源码。
+    新项目（原名 `new-project\`，2026-09 改名）**，它最初就是「参考本项目」抽出来的核心：
+    把本仓库跑通的坐标口径、提示词、解析与打标逻辑做成可 `pip install` 的正式库。
+  - ⚠️ **2026-09-18 起关系变成双向共用**：四组两边都在用的规则已**上游进库**，本仓库改为从库里引用 ——
+    ① thinking 合并规则 → `objloc/providers.py`；② 探测型测试图（圆点阵/文字阶梯/竖线带/分辨率缩放）
+    → `objloc/samples/generators.py`；③ 判分口径（中心点命中/文本标签/坐标空间诊断）
+    → `objloc/benchmark/{metrics,labels}.py`；④ 工具循环（多轮编排 / 工具注册执行 / 上下文注入）
+    → `objloc/agent.py`、`objloc/tools/`、`objloc/tool_schema.py`。
+    这八个文件现在都是**薄层**：转出库的实现，或者只做本仓库特有的适配
+    （agent.py 那层负责把本仓库的 ChatClient 接上库期望的客户端契约、并注入 `runs/scratch` 输出目录）。
+    **改这几处共用规则时改库**（`qsmy-deepseek-locator`），不要改本仓库的薄层 ——
+    薄层里写的行为都由库决定。依赖方向没有反转：库仍然不 import 本仓库的任何东西。
+    代价是本仓库多了一条 `qsmy-deepseek-locator` 依赖（见 `requirements.txt`）。
+  - ⚠️ 测试这几个文件时要把库的源码加进 `PYTHONPATH`（本机未 pip install 该库）：
+    `PYTHONPATH=<库>/src:. python tests/test_benchmark.py`。
   - ⚠️ 改路径时注意：本文件、README.md 目录树、以及下方第 5 节的命令里都写死了这个绝对路径，
     搬目录要一并改（改完跑 `python tests\test_docrefs.py` 确认引用没断）。
 - Python 3.11（Windows / PowerShell）
@@ -175,7 +186,14 @@ runs/                        运行产物；**根目录只放子目录与日志�
 统一产出：`reasoning` / `content` / `tool_call_delta` / `finish`；终端、网页、SSE 共用一套实现。
 `tool_call_delta` 按 `index` 聚合，参数是分片字符串，需要累加。
 
-### 4.2 工具执行框架（tools/registry.py）
+### 4.2 工具执行框架（tools/registry.py，实现 2026-09-18 起已在库中）
+⚠️ **实现搬进了 `qsmy_deepseek_locator.tools`**（0.2.0），本仓库的 `objloc/tools/` 与
+`objloc/tool_schema.py` 只做转出。下面这些约定**仍然全部成立**，只是要改它们得去改库。
+Agent 循环同理：`objloc/agent.py` 是薄层，规则本体在库的 `agent.run_agent`。
+⚠️ 一处必须记住的差异：库的**客户端**契约是 `stream(messages, *, settings, tools, log)`，
+事件里增量那一层叫 `tool_call`；本仓库的 providers 是 `stream_chat(..., thinking=)`、
+增量叫 `tool_call_delta`。薄层里那个 `_ClientAdapter` 负责两边对齐，
+**改名那一步不能省**（库 agent 对外 yield 的 `tool_call` 是拼好的完整调用，同名不同义）。
 - `register(func)`：schema 从**函数名 + docstring 首行 + 参数 Annotated 注解**自动生成，不要手写 schema。
 - `execute(name, args, context=...)`：解析参数 → 执行 → 序列化；异常会作为文本回填给模型，不抛穿。
 - **上下文注入（重要）**：模型无法知道的参数（如"当前图片地址"）用
@@ -276,8 +294,10 @@ DeepSeek 默认先输出思维链（`reasoning_content`）再给正文。本项�
   2. 服务端默认 —— `Settings.thinking`，它自己又是一条 配置文件 > 环境变量 `THINKING=0/1` >
      缺省开启 的小链（见 4.10）。网页上勾的那个框会写进 `config.local.json` 并**盖住环境变量**；
   3. 缺省开启。
-- **一处实现**：`objloc/providers.py: resolve_thinking()` 是唯一解析处，真实客户端与 Mock 共用，
+- **一处实现**：`objloc/providers.py: resolve_thinking()` 是本项目唯一的解析入口，真实客户端与 Mock 共用，
   别再各写一份（曾经 Mock 漏了 effort 合法性校验，被自测抓出来）。
+  ⚠️ 2026-09-18 起**规则本体在库里**（`qsmy_deepseek_locator.merge_thinking`），本文件只是薄封装负责
+  注入本项目的默认值（`Settings.thinking` / `Settings.reasoning_effort`）—— 要改规则请改库。
 - **`reasoning_content` 回传**：带 `tools` 时官方要求历史轮次的 `reasoning_content` 原样回传
   （`objloc/agent.py`）。本项目**只在确有思考内容时**附加该字段，关闭思考时就不带。
   官方的"不回传会 400"在本机实测**没有复现**，但仍按官方写法来，不依赖未证实行为。

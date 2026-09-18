@@ -30,9 +30,13 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator, Protocol
 
+# 0.1.3 起，thinking 的合并规则由库提供（此前本项目与库各写了一份，规则已经开始漂移）。
+# 这是本项目第一次依赖 qsmy-deepseek-locator —— 关系从「库单向抽取自本项目」变成了双向共用，
+# 依赖方向没有反转：库不依赖本项目，只是把两边共用的规则收拢到一处。
+from qsmy_deepseek_locator import merge_thinking
+
 from objloc.config import (
     IMAGE_DETAILS,
-    REASONING_EFFORTS,
     Settings,
     get_settings,
     thinking_payload,
@@ -86,12 +90,18 @@ def resolve_thinking(
     否则返回 None —— 表示不传该参数，交由服务端按默认 high 处理，
     这样非法输入不会变成 400，也不会悄悄改变模型行为。
     """
-    enabled = settings.thinking if thinking is None else bool(thinking)
-    if not enabled:
-        return False, None
-    effort = (settings.reasoning_effort if reasoning_effort is None else reasoning_effort) or ""
-    effort = effort.strip().lower()
-    return True, (effort if effort in REASONING_EFFORTS else None)
+    # 规则本体在库里（0.1.3 上游化）：本函数此前与库各持一份，两份规则**并不严格等价** ——
+    # 本项目的写法把「默认值为 None」也当成关闭，库把 None 当成「两样都不传」。
+    # 这个项目恰好不会触发差异（settings.thinking 是纯 bool），但规则重复本身就是下一次漂移的入口。
+    enabled, effort = merge_thinking(
+        thinking,
+        reasoning_effort,
+        default_thinking=settings.thinking,
+        default_effort=settings.reasoning_effort,
+    )
+    # 本项目口径与库仍有一处刻意的不同：这里的「没表态」按关闭处理（返回 bool 而非 None），
+    # 因为下游消费方（extra_body）只需要 enabled/disabled 两种状态。
+    return (False if enabled is None else enabled), effort
 
 
 # --------------------------------------------------------------------------- #

@@ -1,35 +1,66 @@
-"""Agent 主循环：流式输出 + 工具执行。
+# -*- coding: utf-8 -*-
+"""Agent 主循环 —— 实现已上游到 qsmy-deepseek-locator（0.2.0），这里只做转出与适配。
 
-流程：
-    1. 调用模型（stream=True），把 reasoning / content / tool_call 增量实时吐出；
-    2. 若本轮出现 tool_calls，则交给 ToolRegistry 逐个执行，并把 role=tool 结果
-       追加进消息历史，然后进入下一轮；
-    3. 直到模型不再请求工具（finish_reason=stop）为止。
+为什么改成薄层
+--------------
+工具循环（多轮调用 + 工具执行）是本项目、库、安卓 App 三边共用的一套编排逻辑：
+事件协议一样、工具框架一样、连「工具报错要回填给模型而不是抛穿」这种细节都一样。
+三份实现就是三次改漏的机会，所以规则本体搬进了库的 `qsmy_deepseek_locator.agent`。
 
-对外只暴露一个事件生成器 run_agent(...)，Web / CLI 都消费同一套事件，
-因此流式展示与工具执行只有一份实现。
+本文件留下两件本项目独有的事（库不该知道的事）：
 
-思考模式（thinking）：
-    由 run_agent(thinking=...) 按次覆盖，缺省取 Settings.thinking；
-    关闭后模型不再产出 reasoning 事件，正文照常。
+1. **客户端适配**（`_ClientAdapter`）：本项目的 ChatClient 是 `stream_chat(messages,
+   tools=, thinking=, reasoning_effort=)`（按次覆盖思考开关），库期望的是
+   `stream(messages, *, settings, tools, log)`（从 settings 读）。
+2. **输出目录注入**：模型自己调的 annotate_image 落在本项目的 `runs/scratch/`
+   （见 AGENTS.md#4.9）。库不认这个目录，所以由这里作为运行上下文注入。
+
+⚠️ 事件名的一处**必须**转换：本项目的增量事件叫 `tool_call_delta`，库里叫 `tool_call`；
+而库里 agent **对外** yield 的 `tool_call` 是**拼好的完整调用** —— 同名不同义。
+不换名的话，agent 会把「完整的调用」当成「增量分片」再拼一次，参数直接变成垃圾。
+
+@doc docs/DeepSeek-Tool-Calls.md#在对话中间插入工具调用
+（该文档解决"assistant 消息里的 tool_calls 与 role=tool 结果该怎么排布"的问题 ——
+本文件把客户端事件改名、库那一层再按 index 拼装，两处都按它的格式来。）
 
 @doc docs/DeepSeek-Thinking-Mode.md#工具调用
 （该文档解决"带 tools 时 reasoning_content 要不要回传给 API"的问题。）
-
-@doc docs/DeepSeek-Tool-Calls.md#在对话中间插入工具调用
-（该文档解决"assistant 消息里的 tool_calls 与 role=tool 结果该怎么排布"的问题，
-本模块第 2 步追加消息历史时按它的格式来。）
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any, Iterator
 
+from qsmy_deepseek_locator.agent import (
+    build_messages as _lib_build_messages,
+    collect_final_text,
+    collect_items,
+    extract_items,
+)
+from qsmy_deepseek_locator.agent import run_agent as _lib_run_agent
+from qsmy_deepseek_locator.config import Settings as _LibSettings
+
 from objloc.config import get_settings
-from objloc.parsing import decode_json_points, to_items
-from objloc.providers import ChatClient, build_client, image_part
-from objloc.tools import ToolRegistry, build_default_registry
+from objloc.providers import ChatClient, build_client
+from objloc.visualizer import SCRATCH_DIR
+
+
+class _ClientAdapter:
+    """把本项目的 ChatClient 适配成库 agent 期望的客户端契约（见模块头注释）。"""
+
+    def __init__(self, client: ChatClient) -> None:
+        self._client = client
+
+    def stream(self, messages, *, settings=None, tools=None, log=None) -> Iterator[dict]:
+        thinking = None if settings is None else settings.thinking
+        effort = None if settings is None else settings.reasoning_effort
+        for event in self._client.stream_chat(
+            messages, tools=tools, thinking=thinking, reasoning_effort=effort
+        ):
+            if event.get("type") == "tool_call_delta":
+                yield {**event, "type": "tool_call"}   # 增量改名，见模块头注释
+            else:
+                yield event
 
 
 def build_messages(
@@ -42,229 +73,62 @@ def build_messages(
 ) -> list[dict]:
     """拼装首轮消息列表（system + 可选的图片/文本 user 消息）。
 
-    Args:
-        image_detail: 按次覆盖 image_url 的 detail（见 config.IMAGE_DETAILS）；
-            省略时用 Settings.image_detail（config.local.json > IMAGE_DETAIL > 空）。
+    system 提示词与图片精度都**默认取本项目 Settings**（config.local.json > 环境变量 > 内置），
+    这是本项目的老行为；库那一层是纯参数化的，默认值由调用方给。
     """
     settings = get_settings()
-    messages: list[dict] = [
-        {"role": "system", "content": system_prompt or settings.system_prompt}
-    ]
-    if history:
-        messages.extend(history)
-
-    if image:
-        messages.append({
-            "role": "user",
-            "content": [
-                image_part(image, image_detail if image_detail is not None else settings.image_detail),
-                {"type": "text", "text": prompt or "请识别图中主要目标并输出坐标。"},
-            ],
-        })
-    else:
-        messages.append({"role": "user", "content": prompt})
-    return messages
-
-
-def _accumulate_tool_calls(pending: dict[int, dict]) -> list[dict]:
-    """把流式增量拼装成 OpenAI 格式的 tool_calls 列表。"""
-    calls = []
-    for index in sorted(pending):
-        entry = pending[index]
-        if not entry.get("name"):
-            continue
-        calls.append({
-            "id": entry.get("id") or f"call_{index}",
-            "type": "function",
-            "function": {
-                "name": entry["name"],
-                "arguments": entry.get("arguments") or "{}",
-            },
-        })
-    return calls
+    return _lib_build_messages(
+        prompt,
+        image_url=image,
+        system_prompt=system_prompt or settings.system_prompt,
+        image_detail=image_detail if image_detail is not None else settings.image_detail,
+        history=history,
+    )
 
 
 def run_agent(
     messages: list[dict],
     *,
     client: ChatClient | None = None,
-    registry: ToolRegistry | None = None,
+    registry: Any | None = None,
     max_rounds: int | None = None,
     use_tools: bool = True,
     tool_context: dict | None = None,
     thinking: bool | None = None,
     reasoning_effort: str | None = None,
 ) -> Iterator[dict]:
-    """执行 agent 循环，逐个产出事件字典。
+    """执行 agent 循环，逐个产出事件字典（事件类型与字段与库完全一致）。
 
-    Args:
-        tool_context: 运行上下文，用于注入工具中不暴露给模型的参数
-            （如 {"source": 当前图片路径}）。
-        thinking: 是否开启思考模式；None 表示用 Settings.thinking（THINKING 环境变量）。
-            关闭后模型直接给正文，不再有 reasoning 事件。
-        reasoning_effort: 思考强度（low/medium/high/xhigh/max），仅在思考开启时生效。
-
-    事件类型：
-        round_start / reasoning / content / tool_call / tool_result /
-        message / done / error
+    tool_context 里会**自动补上本项目的 output_dir**（模型调的标注图落 runs/scratch/），
+    调用方传的同名键优先。
     """
     settings = get_settings()
     client = client or build_client(settings)
-    # 先解析成确定的布尔值，保证「真实客户端 / Mock 客户端 / 网络层」看到的是同一个决定
-    thinking_enabled = settings.thinking if thinking is None else bool(thinking)
-    registry = registry or build_default_registry()
-    rounds = max_rounds or settings.max_tool_rounds
-    tools = registry.spec() if use_tools else None
 
-    final_content = ""
-    for round_index in range(rounds):
-        yield {"type": "round_start", "index": round_index, "thinking": thinking_enabled}
+    context = {"output_dir": str(SCRATCH_DIR)}
+    context.update(tool_context or {})
 
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        pending_tool_calls: dict[int, dict] = {}
-        finish_reason: str | None = None
-
-        try:
-            for event in client.stream_chat(
-                messages,
-                tools=tools,
-                thinking=thinking_enabled,
-                reasoning_effort=reasoning_effort,
-            ):
-                etype = event.get("type")
-                if etype == "reasoning":
-                    reasoning_parts.append(event["text"])
-                    yield {"type": "reasoning", "text": event["text"]}
-                elif etype == "content":
-                    content_parts.append(event["text"])
-                    yield {"type": "content", "text": event["text"]}
-                elif etype == "tool_call_delta":
-                    idx = event.get("index", 0)
-                    entry = pending_tool_calls.setdefault(
-                        idx, {"id": "", "name": "", "arguments": ""}
-                    )
-                    if event.get("id"):
-                        entry["id"] = event["id"]
-                    if event.get("name"):
-                        entry["name"] = event["name"]
-                    if event.get("arguments"):
-                        entry["arguments"] += event["arguments"]
-                elif etype == "finish":
-                    finish_reason = event.get("reason")
-        except Exception as exc:  # noqa: BLE001 - 网络/SDK 异常需要反馈到前端
-            yield {"type": "error", "message": f"模型调用失败：{exc}"}
-            return
-
-        content = "".join(content_parts)
-        reasoning = "".join(reasoning_parts)
-        tool_calls = _accumulate_tool_calls(pending_tool_calls)
-
-        assistant_message: dict[str, Any] = {"role": "assistant", "content": content or None}
-        # 思考模式下，带 tools 的请求要求把历史轮次的 reasoning_content 原样回传，
-        # 否则模型会丢掉上一轮的思考上下文（官方文档甚至说会 400）。
-        # 这里只在「确实有思考内容」时回传：关闭思考模式时本来就没有该字段，
-        # 而不是补一个空串——空串是否被服务端接受没有实测依据，不冒这个险。
-        if reasoning and thinking_enabled:
-            assistant_message["reasoning_content"] = reasoning
-        if tool_calls:
-            assistant_message["tool_calls"] = tool_calls
-        messages.append(assistant_message)
-        yield {"type": "message", "message": assistant_message, "finish_reason": finish_reason}
-
-        if not tool_calls:
-            final_content = content
-            yield {
-                "type": "done",
-                "reason": finish_reason or "stop",
-                "content": final_content,
-                "rounds": round_index + 1,
-                "thinking": thinking_enabled,
-                "messages": messages,
-            }
-            return
-
-        # ---- 执行工具 ----
-        for call in tool_calls:
-            fn = call["function"]
-            name = fn["name"]
-            raw_args = fn["arguments"]
-            yield {
-                "type": "tool_call",
-                "id": call["id"],
-                "name": name,
-                "arguments": raw_args,
-            }
-            result = registry.execute(name, raw_args, context=tool_context)
-            yield {
-                "type": "tool_result",
-                "id": call["id"],
-                "name": name,
-                "ok": result.ok,
-                "content": result.content,
-                "elapsed_ms": round(result.elapsed_ms, 1),
-            }
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call["id"],
-                "content": result.content,
-            })
-
-    yield {
-        "type": "done",
-        "reason": "max_rounds",
-        "content": final_content,
-        "rounds": rounds,
-        "thinking": thinking_enabled,
-        "messages": messages,
-    }
-
-
-def extract_items(text: str) -> list[dict]:
-    """从模型最终文本中抽取坐标对象列表，供标注使用。"""
-    if not text:
-        return []
-    data = decode_json_points(text)
-    if isinstance(data, dict):
-        return [data]
-    if isinstance(data, list):
-        return [d for d in data if isinstance(d, dict)]
-    return []
-
-
-def collect_items(events: list[dict], final_text: str = "") -> list[dict]:
-    """从事件流与最终文本中收集可标注的坐标对象。
-
-    优先用最终正文里的 JSON；若没有，则回溯工具执行结果
-    （模型可能把坐标交给 parse_coordinates 等工具处理）。
-    """
-    items = [d for d in extract_items(final_text) if "bbox_2d" in d or "point_2d" in d]
-    if items:
-        return items
-
-    for event in reversed(events):
-        if event.get("type") != "tool_result" or not event.get("ok"):
-            continue
-        try:
-            data = json.loads(event.get("content") or "")
-        except Exception:  # noqa: BLE001
-            continue
-        got = [d for d in to_items(data) if "bbox_2d" in d or "point_2d" in d]
-        if got:
-            return got
-    return []
-
-
-def collect_final_text(messages: list[dict]) -> str:
-    """取最后一条 assistant 正文。"""
-    for msg in reversed(messages):
-        if msg.get("role") == "assistant" and msg.get("content"):
-            return str(msg["content"])
-    return ""
+    lib_settings = _LibSettings(
+        thinking=settings.thinking,
+        reasoning_effort=settings.reasoning_effort,
+        max_tool_rounds=settings.max_tool_rounds,
+        system_prompt=settings.system_prompt,
+        image_detail=settings.image_detail,
+    )
+    yield from _lib_run_agent(
+        messages,
+        client=_ClientAdapter(client),
+        registry=registry,
+        settings=lib_settings,
+        max_rounds=max_rounds,
+        use_tools=use_tools,
+        tool_context=context,
+        thinking=thinking,
+        reasoning_effort=reasoning_effort,
+    )
 
 
 def run_agent_simple(prompt: str, image: str | None = None, **kwargs) -> dict:
-    # thinking / reasoning_effort 等参数通过 **kwargs 透传给 run_agent
     """非流式便捷入口：执行完整 agent 循环并返回最终结果。"""
     messages = build_messages(prompt, image=image)
     events = list(run_agent(messages, **kwargs))
@@ -276,3 +140,13 @@ def run_agent_simple(prompt: str, image: str | None = None, **kwargs) -> dict:
         "items": extract_items(text),
         "messages": done.get("messages") if done else messages,
     }
+
+
+__all__ = [
+    "build_messages",
+    "collect_final_text",
+    "collect_items",
+    "extract_items",
+    "run_agent",
+    "run_agent_simple",
+]
