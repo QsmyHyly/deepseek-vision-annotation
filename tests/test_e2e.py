@@ -34,9 +34,14 @@ from objloc.visualizer import annotate, load_image, render_annotations, summariz
 
 _TMPDIR = Path(tempfile.mkdtemp(prefix="objloc_e2e_"))
 
-# render_annotations 的默认目录（runs/scratch/）也一并指到临时目录：
-# 下面用工具 annotate_image 跑端到端时它不传 output_dir，走的就是这个默认值，
-# 不指走的话测试每跑一次就往项目的 runs/scratch 里丢一张 PNG。
+# render_annotations 的默认目录（runs/scratch/）指到临时目录，否则每跑一次就往项目的
+# runs/scratch 里丢一张 PNG。
+#
+# ⚠️ 这条补丁只管 objloc.visualizer **自己**那条路径。annotate_image 工具的实现 0.2.0 起
+# 在库里（库的 tools/builtin.py），它没给 output_dir 时用的是库的 Path.cwd()，
+# 跟本模块的这个全局量没有关系 —— 所以下面直接调工具那处必须在 context 里显式给
+# output_dir，否则散图会落在**当前工作目录**（实测落在仓库根目录，还被一次
+# git add -A 收进了提交）。补丁看着像在管这件事，其实管不到，这类"看着管用"的补丁最误事。
 import objloc.visualizer as _visualizer   # noqa: E402
 
 _visualizer.SCRATCH_DIR = _TMPDIR
@@ -202,7 +207,7 @@ check("parsing core stays raw (probe relies on it)",
 from objloc.samples import ensure as _ensure_sample
 _sample_png = _ensure_sample("marker_900")[1]
 _src = _reg.execute("annotate_image", {"items": _legacy},
-                    context={"source": str(_sample_png)})
+                    context={"source": str(_sample_png), "output_dir": str(_TMPDIR)})
 check("tool annotate_image ok with legacy scale", _src.ok, _src.content)
 # 追加用例：center_hit 与 expect_shape
 from objloc.benchmark import center_hit, evaluate_sample
